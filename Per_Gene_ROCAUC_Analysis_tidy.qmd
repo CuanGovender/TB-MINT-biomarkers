@@ -1,0 +1,444 @@
+
+---
+title: "Per-Gene ROC/AUC Analysis (Core Biomarker Set)"
+format:
+  html:
+    self-contained: true
+    execute:
+      warning: false
+      message: false
+---
+
+
+
+
+
+# Per-gene ROC/AUC analysis (core 21-gene set)
+
+**What this file does.** It measures how well each of the 21 genes shared by the three MINT models separates the groups on its own, using the held-out UK microarray cohort (GSE19444). For every gene it computes the area under the ROC curve (AUC) for the three pairwise comparisons (Control vs LTBI, Control vs ATB, LTBI vs ATB), ranks the genes, draws ROC curves for the four best genes, tests a small logistic-regression score for Control vs LTBI, and draws ROC curves for the three MINT models themselves.
+
+**Role in the project:** evaluation on the held-out cohort only. Nothing here is used to fit or tune the MINT models.
+
+**Inputs** (made by `MINT_Integration_Pipeline`): `X_valid_filt.rds`, `Y_valid.rds` and `genes_in_all_three.rds`. The last three chunks also need the fitted models `stage1_model`, `stage2_model` and `ctrl_atb_model`; the MINT file saves them as `.rds` files, but this file does not load them (see the notes).
+
+**Output:** `per_gene_auc_results.csv`.
+
+**Notes.**
+
+- The `setwd()` path in section 2 points to the author's computer and must be changed to run the file.
+- `direction = "auto"` lets pROC choose, for each gene, whether higher or lower expression marks the second group, so the AUC is never below 0.5.
+- The chunk "Build a composite score" uses `auc_ltbi_ranked`, which is not created in this file. The last three chunks use `stage1_model`, `stage2_model` and `ctrl_atb_model`, which are not loaded here. Run the MINT file first in the same session, or load the `.rds` files, before running them.
+- The leave-one-out chunk appears three times with identical code (earlier copies were kept as a record). Only one is needed.
+- The text between chunks is a set of working notes. Where its wording differs from the report, the report is the reference.
+
+
+
+## 1. Setup
+
+```{r}
+## ---- 1. Setup ----
+
+# This document computes per-gene AUC (area under the ROC curve) for
+# the core 21-gene MINT biomarker set, evaluated on GSE19444 (the
+# external validation set), across all three pairwise class
+# comparisons (Control vs LTBI, Control vs ATB, LTBI vs ATB).
+
+library(pROC)
+library(ggplot2)
+library(dplyr)
+```
+
+
+
+
+## 2. Load the inputs
+
+Held-out expression matrix, class labels and the 21 shared genes.
+
+```{r}
+## ---- 2. Load required objects ----
+
+setwd("C:/Users/27826/Documents/HonoursProject")
+
+X_valid_filt <- readRDS("X_valid_filt.rds")
+Y_valid <- readRDS("Y_valid.rds")
+genes_in_all_three <- readRDS("genes_in_all_three.rds")
+
+## ---- 2.1 Diagnostic checks ----
+
+dim(X_valid_filt)
+length(Y_valid)
+length(genes_in_all_three)
+table(Y_valid)
+```
+
+## 3. AUC for every gene and every pairwise comparison
+
+A function computes the AUC of one gene for two classes; the results are tabulated, ranked by mean AUC and saved.
+
+```{r}
+## ---- 3. Compute per-gene AUC for each pairwise comparison ----
+
+compute_gene_auc <- function(gene, expr_matrix, class_vec, class_a, class_b) {
+  idx <- class_vec %in% c(class_a, class_b)
+  gene_expr <- expr_matrix[idx, gene]
+  outcome <- factor(class_vec[idx], levels = c(class_a, class_b))
+  
+  # direction = "auto": pROC picks the direction for each gene (AUC >= 0.5).
+  roc_obj <- roc(response = outcome, predictor = gene_expr, 
+                  levels = c(class_a, class_b), direction = "auto", quiet = TRUE)
+  
+  as.numeric(auc(roc_obj))
+}
+
+## ---- 3.1 Confirm the function works on one gene first ----
+
+test_auc <- compute_gene_auc(genes_in_all_three[1], X_valid_filt, Y_valid, "Control", "LTBI")
+test_auc
+
+## ---- 3.2 Build the full results table using vapply ----
+
+auc_results <- data.frame(
+  Gene = genes_in_all_three,
+  AUC_Control_vs_LTBI = vapply(genes_in_all_three, compute_gene_auc, numeric(1),
+                                expr_matrix = X_valid_filt, class_vec = Y_valid, 
+                                class_a = "Control", class_b = "LTBI"),
+  AUC_Control_vs_ATB = vapply(genes_in_all_three, compute_gene_auc, numeric(1),
+                               expr_matrix = X_valid_filt, class_vec = Y_valid, 
+                               class_a = "Control", class_b = "ATB"),
+  AUC_LTBI_vs_ATB = vapply(genes_in_all_three, compute_gene_auc, numeric(1),
+                            expr_matrix = X_valid_filt, class_vec = Y_valid, 
+                            class_a = "LTBI", class_b = "ATB")
+)
+
+## ---- 3.3 Diagnostic check ----
+
+auc_results
+
+## ---- 3.4 Clean, formatted table using knitr ----
+
+library(knitr)
+
+## Round AUC values for readability
+auc_results_display <- auc_results
+auc_results_display$AUC_Control_vs_LTBI <- round(auc_results_display$AUC_Control_vs_LTBI, 3)
+auc_results_display$AUC_Control_vs_ATB <- round(auc_results_display$AUC_Control_vs_ATB, 3)
+auc_results_display$AUC_LTBI_vs_ATB <- round(auc_results_display$AUC_LTBI_vs_ATB, 3)
+
+## Sort by strongest average discriminative power (optional, but nice for reading)
+auc_results_display$Mean_AUC <- round(rowMeans(auc_results_display[, 2:4]), 3)
+auc_results_display <- auc_results_display[order(-auc_results_display$Mean_AUC), ]
+
+kable(
+  auc_results_display,
+  col.names = c("Gene", "AUC (Control vs LTBI)", "AUC (Control vs ATB)", 
+                "AUC (LTBI vs ATB)", "Mean AUC"),
+  caption = "Per-gene AUC on external validation set (GSE19444) across all three pairwise class comparisons",
+  align = c("l", "c", "c", "c", "c")
+)
+
+## ---- Save for reference ----
+write.csv(auc_results_display, "per_gene_auc_results.csv", row.names = FALSE)
+```
+Per-gene AUC analysis, computed on the external validation set (GSE19444) across all three pairwise class comparisons, showed a consistent pattern matching the multivariate model results: discrimination of active tuberculosis from either Control or LTBI was strong for nearly every gene in the core biomarker set (AUC range 0.77–0.94), while discrimination of Control from LTBI was substantially weaker across all genes (AUC range 0.44–0.69), with several genes performing at or below chance level for this specific comparison. ID3, ATF3, SOCS1, and C1QB showed the strongest overall discriminative power (mean AUC > 0.79 across all three comparisons), with ATF3 achieving an AUC of 0.940 for distinguishing Control from ATB — comparable to the strongest individual-gene biomarkers reported in the tuberculosis literature. This gene-level analysis provides further, independent confirmation that the transcriptional distinction between active tuberculosis and either Control or LTBI is substantially clearer than the distinction between Control and LTBI themselves, consistent with findings throughout this study from model performance, heatmap visualisation, and pathway enrichment analysis.
+
+
+## 4. ROC curves for the top four genes: Control vs ATB
+
+The four genes with the highest mean AUC.
+
+```{r}
+## ---- 4. Plot ROC curves for top genes ----
+
+## Select top 4 genes by mean AUC for a clean, readable set of plots
+# auc_results_display is already sorted by mean AUC (section 3.4).
+top_genes <- auc_results_display$Gene[1:4]
+top_genes
+
+## ---- 4.1 ROC curves: Control vs ATB (strongest comparison) ----
+
+par(mfrow = c(2, 2))
+
+for (gene in top_genes) {
+  idx <- Y_valid %in% c("Control", "ATB")
+  gene_expr <- X_valid_filt[idx, gene]
+  outcome <- factor(Y_valid[idx], levels = c("Control", "ATB"))
+  
+  roc_obj <- roc(response = outcome, predictor = gene_expr, 
+                  levels = c("Control", "ATB"), direction = "auto", quiet = TRUE)
+  
+  plot(roc_obj, main = paste0(gene, " (Control vs ATB)\nAUC = ", 
+                                round(auc(roc_obj), 3)),
+       col = "firebrick", lwd = 2)
+}
+
+par(mfrow = c(1, 1))
+```
+Figure X shows ROC curves for the four top-performing genes (ID3, ATF3, SOCS1, C1QB) for the Control-versus-ATB comparison on the external validation set. All four curves showed strong separation from the diagonal line of chance, consistent with their high AUC values (0.90–0.94), visually confirming these genes' strong individual discriminative power between Control and active tuberculosis.
+
+
+## 5. ROC curves for the same genes: Control vs LTBI
+
+The weakest comparison, shown for contrast.
+
+```{r}
+#| fig-width: 10
+#| fig-height: 10
+
+## ---- 5. ROC curves: Control vs LTBI (weakest comparison, for contrast) ----
+
+par(mfrow = c(2, 2))
+
+for (gene in top_genes) {
+  idx <- Y_valid %in% c("Control", "LTBI")
+  gene_expr <- X_valid_filt[idx, gene]
+  outcome <- factor(Y_valid[idx], levels = c("Control", "LTBI"))
+  
+  roc_obj <- roc(response = outcome, predictor = gene_expr, 
+                  levels = c("Control", "LTBI"), direction = "auto", quiet = TRUE)
+  
+  plot(roc_obj, main = paste0(gene, " (Control vs LTBI)\nAUC = ", 
+                                round(auc(roc_obj), 3)),
+       col = "steelblue", lwd = 2)
+}
+
+par(mfrow = c(1, 1))
+```
+Figure X shows ROC curves for the same four genes for the Control-versus-LTBI comparison. In contrast to the Control-versus-ATB curves, all four genes showed only modest separation from the diagonal line of chance (AUC 0.64–0.69), visually illustrating the substantially weaker individual gene-level discrimination between Control and LTBI relative to active tuberculosis. This side-by-side comparison reinforces, at the level of individual biomarker genes, the pattern observed throughout this study using multivariate model performance, heatmap visualisation, and pathway enrichment: the transcriptional distinction between Control and LTBI is considerably subtler than between either group and active disease.
+
+This pair of figures (strong ATB curves next to weak LTBI curves, same 4 genes, side by side) is genuinely one of the clearest, most persuasive visual results in your whole thesis — it makes an abstract statistical difference (BER 0.13 vs 0.41) immediately intuitive just by looking at curve shape.
+
+
+## 6. ROC curves for the same genes: LTBI vs ATB
+
+```{r}
+#| fig-width: 10
+#| fig-height: 10
+
+## ---- 6. ROC curves: LTBI vs ATB ----
+
+par(mfrow = c(2, 2))
+
+for (gene in top_genes) {
+  idx <- Y_valid %in% c("LTBI", "ATB")
+  gene_expr <- X_valid_filt[idx, gene]
+  outcome <- factor(Y_valid[idx], levels = c("LTBI", "ATB"))
+  
+  roc_obj <- roc(response = outcome, predictor = gene_expr, 
+                  levels = c("LTBI", "ATB"), direction = "auto", quiet = TRUE)
+  
+  plot(roc_obj, main = paste0(gene, " (LTBI vs ATB)\nAUC = ", 
+                                round(auc(roc_obj), 3)),
+       col = "maroon", lwd = 2)
+}
+
+par(mfrow = c(1, 1))
+```
+Figure X shows ROC curves for the same four genes for the LTBI-versus-ATB comparison. Discrimination was intermediate between the other two comparisons (AUC 0.79–0.86), stronger than Control-versus-LTBI but slightly weaker than Control-versus-ATB. This gradient is consistent with LTBI and active tuberculosis representing adjacent points along a shared disease spectrum, whereas Control represents a categorically distinct, uninfected state, making the Control-versus-ATB distinction the most transcriptionally pronounced of the three comparisons.
+
+## 7. Composite score for Control vs LTBI
+
+Logistic regression on the five genes with the highest Control vs LTBI AUC.
+
+```{r}
+## ---- Build a composite score using top 5 LTBI-discriminating genes ----
+
+# NOTE: the genes are ranked on these same samples, so the apparent AUC below is optimistic;
+# the leave-one-out check that follows does not repeat the gene selection.
+top5_ltbi_genes <- auc_ltbi_ranked$Gene[1:5]
+top5_ltbi_genes
+
+## Fit a simple logistic regression combining these 5 genes
+idx_cl <- Y_valid %in% c("Control", "LTBI")
+composite_data <- as.data.frame(X_valid_filt[idx_cl, top5_ltbi_genes])
+composite_data$outcome <- factor(Y_valid[idx_cl], levels = c("Control", "LTBI"))
+
+composite_model <- glm(outcome ~ ., data = composite_data, family = "binomial")
+
+# Scores for the samples the model was fitted on (apparent performance).
+composite_score <- predict(composite_model, type = "response")
+
+composite_roc <- roc(composite_data$outcome, composite_score, 
+                      levels = c("Control", "LTBI"), direction = "auto", quiet = TRUE)
+
+auc(composite_roc)
+plot(composite_roc, main = paste0("Composite score (top 5 genes) - Control vs LTBI\nAUC = ", 
+                                    round(auc(composite_roc), 3)),
+     col = "purple", lwd = 2)
+```
+
+## 7b. Leave-one-out check of the composite score
+
+Each sample is predicted by a model fitted without it.
+
+```{r}
+## ---- Proper check: leave-one-out cross-validation of the composite score ----
+
+n <- nrow(composite_data)
+loocv_predictions <- numeric(n)
+
+for (i in 1:n) {
+  train_data <- composite_data[-i, ]
+  test_data <- composite_data[i, , drop = FALSE]
+  
+  model_i <- glm(outcome ~ ., data = train_data, family = "binomial")
+  loocv_predictions[i] <- predict(model_i, newdata = test_data, type = "response")
+}
+
+loocv_roc <- roc(composite_data$outcome, loocv_predictions, 
+                  levels = c("Control", "LTBI"), direction = "auto", quiet = TRUE)
+
+auc(loocv_roc)
+plot(loocv_roc, main = paste0("Composite score (LOOCV) - Control vs LTBI\nAUC = ", 
+                                round(auc(loocv_roc), 3)),
+     col = "purple", lwd = 2)
+```
+To assess whether combining multiple genes could improve discrimination between Control and LTBI beyond any single gene's performance, a composite score was constructed using the five genes with the highest individual Control-versus-LTBI AUC (C1QB, SOCS1, BACH2, ID3, DYRK2), combined via logistic regression. When evaluated on the same samples used to fit the model, this composite score showed a substantially higher AUC (0.849) than any individual gene; however, this estimate was inflated by overfitting, given the small sample size (n = 33) relative to the number of predictors. Under leave-one-out cross-validation, a more honest estimate of generalisation performance, the composite score's AUC fell to 0.659 — no better than, and slightly below, the best-performing individual gene (C1QB, AUC = 0.687). This result indicates that combining genes does not reliably improve discrimination between Control and LTBI in this dataset, reinforcing the conclusion, supported independently by model performance, heatmap visualisation, and pathway enrichment analysis, that the transcriptional distinction between these two states reflects a genuine biological limitation rather than one that can be resolved through more complex modelling of the same gene signature.
+
+
+## 7c. Leave-one-out check (repeat)
+
+Same code as 7b.
+
+```{r}
+## ---- Proper check: leave-one-out cross-validation of the composite score ----
+
+n <- nrow(composite_data)
+loocv_predictions <- numeric(n)
+
+for (i in 1:n) {
+  train_data <- composite_data[-i, ]
+  test_data <- composite_data[i, , drop = FALSE]
+  
+  model_i <- glm(outcome ~ ., data = train_data, family = "binomial")
+  loocv_predictions[i] <- predict(model_i, newdata = test_data, type = "response")
+}
+
+loocv_roc <- roc(composite_data$outcome, loocv_predictions, 
+                  levels = c("Control", "LTBI"), direction = "auto", quiet = TRUE)
+
+auc(loocv_roc)
+plot(loocv_roc, main = paste0("Composite score (LOOCV) - Control vs LTBI\nAUC = ", 
+                                round(auc(loocv_roc), 3)),
+     col = "purple", lwd = 2)
+```
+
+## 7d. Leave-one-out check (repeat)
+
+Same code as 7b.
+
+```{r}
+## ---- Proper check: leave-one-out cross-validation of the composite score ----
+
+n <- nrow(composite_data)
+loocv_predictions <- numeric(n)
+
+for (i in 1:n) {
+  train_data <- composite_data[-i, ]
+  test_data <- composite_data[i, , drop = FALSE]
+  
+  model_i <- glm(outcome ~ ., data = train_data, family = "binomial")
+  loocv_predictions[i] <- predict(model_i, newdata = test_data, type = "response")
+}
+
+loocv_roc <- roc(composite_data$outcome, loocv_predictions, 
+                  levels = c("Control", "LTBI"), direction = "auto", quiet = TRUE)
+
+auc(loocv_roc)
+plot(loocv_roc, main = paste0("Composite score (LOOCV) - Control vs LTBI\nAUC = ", 
+                                round(auc(loocv_roc), 3)),
+     col = "purple", lwd = 2)
+```
+
+
+## 8. ROC curve for the Stage 1 model (ATB vs non-ATB)
+
+Needs `stage1_model` from the MINT file.
+
+```{r}
+## ---- ROC curve for Stage 1 model (ATB vs Non-ATB) on GSE19444 ----
+
+library(pROC)
+
+## Get predicted probabilities/scores from Stage 1 model
+pred1_valid <- predict(
+  stage1_model,
+  newdata = X_valid_filt,
+  study.test = factor(rep("GSE19444", nrow(X_valid_filt)))
+)
+
+## Extract the predicted score for the "ATB" class (probability-like value)
+stage1_scores <- pred1_valid$predict[, "ATB", 1]  # comp = 1, since Stage 1 has 1 component
+
+## True labels, recoded to match Stage 1's binary framing
+true_stage1 <- factor(ifelse(Y_valid == "ATB", "ATB", "Non_ATB"), levels = c("Non_ATB", "ATB"))
+
+## Build ROC
+roc_stage1 <- roc(true_stage1, stage1_scores, levels = c("Non_ATB", "ATB"), 
+                   direction = "auto", quiet = TRUE)
+
+auc(roc_stage1)
+plot(roc_stage1, main = paste0("Stage 1 Model (ATB vs Non-ATB)\nAUC = ", round(auc(roc_stage1), 3)),
+     col = "firebrick", lwd = 2)
+```
+
+## 9. ROC curve for the Stage 2 model (Control vs LTBI)
+
+Scored on the true Control and LTBI samples, so Stage 2 is judged on its own, not through Stage 1. Needs `stage2_model`.
+
+```{r}
+## ---- ROC curve for Stage 2 model (Control vs LTBI) on GSE19444 ----
+
+## Subset to only samples Stage 1 would route to Stage 2 (Non-ATB predicted),
+## OR use all true Control/LTBI samples directly for a "pure" Stage 2 ROC.
+## Using true labels here (not routed through Stage 1) gives the cleanest,
+## most direct evaluation of Stage 2's own discriminative power.
+
+idx_cl <- Y_valid %in% c("Control", "LTBI")
+X_valid_cl <- X_valid_filt[idx_cl, ]
+true_stage2 <- factor(as.character(Y_valid[idx_cl]), levels = c("Control", "LTBI"))
+
+pred2_valid <- predict(
+  stage2_model,
+  newdata = X_valid_cl,
+  study.test = factor(rep("GSE19444", nrow(X_valid_cl)))
+)
+
+## Extract predicted score for "LTBI" class, using the final component (comp = 3)
+stage2_scores <- pred2_valid$predict[, "LTBI", 3]
+
+roc_stage2 <- roc(true_stage2, stage2_scores, levels = c("Control", "LTBI"), 
+                   direction = "auto", quiet = TRUE)
+
+auc(roc_stage2)
+plot(roc_stage2, main = paste0("Stage 2 Model (Control vs LTBI)\nAUC = ", round(auc(roc_stage2), 3)),
+     col = "yellow", lwd = 2)
+```
+
+## 10. ROC curve for the Control vs ATB model
+
+Needs `ctrl_atb_model`.
+
+```{r}
+## ---- ROC curve for Control vs ATB model on GSE19444 ----
+
+idx_ca <- Y_valid %in% c("Control", "ATB")
+X_valid_ca <- X_valid_filt[idx_ca, ]
+true_ca <- factor(as.character(Y_valid[idx_ca]), levels = c("Control", "ATB"))
+
+pred_ca_valid <- predict(
+  ctrl_atb_model,
+  newdata = X_valid_ca,
+  study.test = factor(rep("GSE19444", nrow(X_valid_ca)))
+)
+
+## Extract predicted score for "ATB" class, using final component (comp = 2)
+ca_scores <- pred_ca_valid$predict[, "ATB", 2]
+
+roc_ca <- roc(true_ca, ca_scores, levels = c("Control", "ATB"), 
+              direction = "auto", quiet = TRUE)
+
+auc(roc_ca)
+plot(roc_ca, main = paste0("Control vs ATB Model\nAUC = ", round(auc(roc_ca), 3)),
+     col = "darkgreen", lwd = 2)
+```
