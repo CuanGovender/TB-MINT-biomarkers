@@ -1,0 +1,1464 @@
+---
+title: "MINT Integration Pipeline"
+format:
+  html:
+    self-contained: true
+    execute:
+      warning: false
+      message: false
+---
+
+
+
+
+# MINT integration pipeline
+
+**Project:** cross-cohort transcriptional biomarkers for tuberculosis (Honours project report, Stellenbosch University).
+
+**What this file does.** It takes the four cleaned whole-blood datasets (made by the four cleaning scripts), keeps the 6 739 genes measured in all of them, builds a training pool from three cohorts and keeps the fourth (GSE19444) out as an external validation set. It then fits and tunes MINT sPLS-DA models (mixOmics), evaluates them by leave-one-group-out cross-validation (LOGOCV) and on the held-out cohort, and extracts the genes the models selected.
+
+| Cohort | Type and origin | Role |
+|---|---|---|
+| GSE19439 | Microarray, UK | Training |
+| GSE84076 | RNA-sequencing, Brazil | Training |
+| GSE107994 | RNA-sequencing, Leicester, UK | Training |
+| GSE19444 | Microarray, UK | Held-out external validation |
+
+**Inputs** (made by the cleaning scripts; not in the repository): `gene_matrix_final_19439.rds`, `gene_matrix_final_19444.rds`, `gene_matrix_final_84076.rds`, `log2_cpm_full_107994.rds`, `clin_19439.rds`, `clin_19444.rds`, `clin_84076.rds`, `clinical_107994_clean.rds`.
+
+**Outputs:** `clin_84076_excl.rds`; `X_train_filt.rds`, `Y_train.rds`, `study_train.rds`, `X_valid_filt.rds`, `Y_valid.rds`, `filtered_genes.rds`; `final_pred_valid.rds`; `ctrl_atb_gene_coordinates.csv`; `biomarker_gene_list_full.csv`, `biomarker_genes_recurring.csv`, `biomarker_genes_all_three_models.csv`; `stage1_model.rds`, `stage2_model.rds`, `ctrl_atb_model.rds`, `all_biomarkers.rds`, `genes_in_all_three.rds`.
+
+**Where each part appears in the report**
+
+| Sections | Content | Report |
+|---|---|---|
+| 2 to 7 | Load data, harmonise labels, shared genes, training pool and held-out set | Methods (harmonisation, data partitioning); Table 1 |
+| 8 | Study-aware PCA of the training pool | Figure 2 |
+| 9 to 12 | Flat three-class model on all 6 739 genes, with external validation | Table 2 (last row; external BER 0.444) |
+| 14 to 15 | limma filter to 208 genes | Methods (feature pre-filtering) |
+| 16 to 19 | Flat model on the 208 filtered genes; distance metrics; wider grid | Table 2 (LOGOCV BER 0.378); Addendum B |
+| 20 to 25 | Two-step classifier: Stage 1 (ATB vs non-ATB), Stage 2 (Control vs LTBI), manual LOGOCV | Table 2 (two-step LOGOCV BER 0.368) |
+| 26 | Sensitivity check: Brazilian cohort left out of Stage 1 | Addendum B |
+| 27 | Two-step classifier on the held-out cohort | Table 2 (external BER 0.393); Figure 4 |
+| 28 | Component-1 loadings and heatmaps | Figure 3; Supplementary Figures S3 and S4 |
+| 30 to 33 | Exploratory Control vs ATB model (BER 0.128) | Table 2 |
+| 37 | Shared (21) and recurring genes | Figure 6; Supplementary Table S3 |
+
+**Notes.**
+
+- Section numbers are not consecutive because some exploratory sections were removed during development.
+- The text between code chunks is a set of working notes written during the analysis. Where its wording differs from the report, the report is the reference.
+- The `setwd()` path in section 2 points to the author's computer and must be changed to run the file.
+- The ordinary PCA of the pooled data (Supplementary Figure S6B) and the step-wise AUCs are not in this file.
+
+
+
+## 1. Setup
+
+Load the packages used below.
+
+```{r}
+## ---- 1. Setup ----
+
+# Load packages required for MINT integration, data manipulation,
+# and downstream visualization.
+
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(mixOmics)   # MINT functions: mint.pca, mint.splsda, tune.mint.splsda
+library(limma)
+library(pheatmap)
+library(knitr)
+```
+
+
+
+## 2. Load the cleaned data
+
+Read the cleaned expression matrices (genes x samples) and clinical tables made by the four cleaning scripts.
+
+```{r}
+## ---- 2. Load preprocessed objects from each dataset ----
+
+# Expression matrices (genes x samples, already log-scale and
+# gene-symbol annotated from each dataset's own preprocessing pipeline)
+## ---- 1.1 Set working directory ----
+
+# EDIT: path to the folder that holds the .rds files made by the cleaning scripts.
+setwd("C:/Users/27826/Documents/HonoursProject")
+
+expr_19439  <- readRDS("gene_matrix_final_19439.rds")   # microarray, log2
+expr_19444  <- readRDS("gene_matrix_final_19444.rds")   # microarray, log2 (held-out validation)
+expr_84076  <- readRDS("gene_matrix_final_84076.rds")   # RNA-seq, log2(FPKM+1)
+expr_107994 <- readRDS("log2_cpm_full_107994.rds")      # RNA-seq, log2 CPM (full filterByExpr set)
+
+# Clinical/phenotype metadata (one row per sample, matched to expr_* columns)
+
+clin_19439  <- readRDS("clin_19439.rds")
+clin_19444  <- readRDS("clin_19444.rds")
+clin_84076 <- readRDS("clin_84076.rds")   # original 36-sample version, for now
+clin_107994 <- readRDS("clinical_107994_clean.rds")
+
+## ---- 2.1 Diagnostic checks ----
+
+# Confirm dimensions match what you expect from earlier
+dim(expr_19439)
+dim(expr_19444)
+dim(expr_84076)
+dim(expr_107994)
+
+dim(clin_19439)
+dim(clin_19444)
+dim(clin_84076)
+dim(clin_107994)
+```
+
+## 3. Harmonise disease-state labels
+
+Give every study the same three labels (Control, LTBI, ATB) so they can be pooled.
+
+```{r}
+## ---- 3. Harmonize outcome labels across datasets ----
+
+# GSE19439 and GSE19444: PTB -> ATB
+# Map each study's own label to the common Control / LTBI / ATB scheme.
+clin_19439$group_harmonized <- recode(
+  as.character(clin_19439$group_status),
+  "PTB" = "ATB"
+)
+
+clin_19444$group_harmonized <- recode(
+  as.character(clin_19444$group_status),
+  "PTB" = "ATB"
+)
+
+# GSE84076: Treated ATB flagged for exclusion (handled in Chunk 4)
+clin_84076$group_harmonized <- recode(
+  as.character(clin_84076$disease_status),
+  "Treated ATB" = "EXCLUDE"
+)
+
+# GSE107994: Active_TB -> ATB, LTBI_Progressor -> LTBI
+clin_107994$group_harmonized <- recode(
+  as.character(clin_107994$group_status),
+  "Active_TB"       = "ATB",
+  "LTBI_Progressor" = "LTBI"
+)
+
+## ---- 3.1 Diagnostic checks ----
+
+table(clin_19439$group_harmonized)
+table(clin_19444$group_harmonized)
+table(clin_84076$group_harmonized)
+table(clin_107994$group_harmonized)
+```
+
+## 4. Remove treated ATB samples from the Brazilian cohort
+
+Samples taken after treatment do not represent untreated disease, so the two treated samples are dropped (36 to 34 samples).
+
+```{r}
+## ---- 4.0 Diagnose sample ID mismatch ----
+
+head(colnames(expr_84076))
+head(clin_84076$sample_id)
+
+length(colnames(expr_84076))
+length(clin_84076$sample_id)
+
+# Check overlap
+sum(clin_84076$sample_id %in% colnames(expr_84076))
+setdiff(clin_84076$sample_id, colnames(expr_84076))
+setdiff(colnames(expr_84076), clin_84076$sample_id)
+
+
+
+
+
+## ---- 4. Exclude Treated ATB samples from GSE84076 ----
+
+# Identify which samples to keep (i.e. NOT flagged EXCLUDE)
+keep_84076 <- clin_84076$group_harmonized != "EXCLUDE"
+
+# Subset clinical metadata
+clin_84076 <- clin_84076[keep_84076, ]
+
+# Subset expression matrix - match by sample_id to be safe rather
+# than relying on row order/position
+expr_84076 <- expr_84076[, clin_84076$sample_id]
+
+## ---- 4.1 Diagnostic checks ----
+
+dim(clin_84076)     # should now be 34 x 20 (36 - 2 excluded)
+dim(expr_84076)      # should now be genes x 34
+table(clin_84076$group_harmonized)   # should show only Control/LTBI/ATB, no EXCLUDE
+
+# Confirm sample order still matches between expr and clin
+identical(colnames(expr_84076), clin_84076$sample_id)
+
+saveRDS(clin_84076, "clin_84076_excl.rds")
+```
+
+## 5. Keep only genes measured in all four datasets
+
+MINT needs the same genes in every study; the four-way intersection is 6 739 genes.
+
+```{r}
+## ---- 5.0.2 Re-check gene intersection after all fixes ----
+
+# Reload the matrices so this chunk can be run on its own.
+expr_19439  <- readRDS("gene_matrix_final_19439.rds")
+expr_19444  <- readRDS("gene_matrix_final_19444.rds")
+expr_84076  <- readRDS("gene_matrix_final_84076.rds")
+expr_107994 <- readRDS("log2_cpm_full_107994.rds")
+
+length(intersect(rownames(expr_19439), rownames(expr_107994)))
+length(intersect(rownames(expr_84076), rownames(expr_107994)))
+
+# Genes present in all four datasets (the report uses these 6 739 genes).
+common_genes <- Reduce(
+  intersect,
+  list(
+    rownames(expr_19439), 
+    rownames(expr_19444),
+    rownames(expr_84076),
+    rownames(expr_107994)
+  )
+)
+
+length(common_genes) 
+#microarray-vs-RNA-seq-107994 overlap
+#RNA-seq-vs-RNA-seq overlap
+#4-way intersection (6,739)
+```
+microarray-vs-RNA-seq-107994 overlap (7,196) and RNA-seq-vs-RNA-seq overlap (10,061) both look reasonable, and the 4-way intersection (6,739) sits below all the pairwise numbers as expected, since it has to satisfy every dataset simultaneously.
+
+
+## 6. Subset and reorder to the shared genes
+
+All matrices use the same genes in the same order.
+
+```{r}
+## ---- 6. Subset and reorder every matrix to the common gene set ----
+
+expr_19439_common  <- expr_19439[common_genes, ]
+expr_19444_common  <- expr_19444[common_genes, ]
+expr_84076_common  <- expr_84076[common_genes, ]
+expr_107994_common <- expr_107994[common_genes, ]
+
+## ---- 6.1 Diagnostic checks ----
+
+dim(expr_19439_common)
+dim(expr_19444_common)
+dim(expr_84076_common)
+dim(expr_107994_common)
+
+# Confirm identical gene order across all 4 (critical for MINT)
+identical(rownames(expr_19439_common), rownames(expr_19444_common))
+identical(rownames(expr_19439_common), rownames(expr_84076_common))
+identical(rownames(expr_19439_common), rownames(expr_107994_common))
+
+dim(clin_84076)
+table(clin_84076$group_harmonized)
+
+## ---- Full re-verify ----
+
+expr_19439  <- readRDS("gene_matrix_final_19439.rds")
+expr_19444  <- readRDS("gene_matrix_final_19444.rds")
+expr_84076  <- readRDS("gene_matrix_final_84076.rds")
+expr_107994 <- readRDS("log2_cpm_full_107994.rds")
+
+clin_19439  <- readRDS("clin_19439.rds")
+clin_19444  <- readRDS("clin_19444.rds")
+clin_84076  <- readRDS("clin_84076_excl.rds")
+clin_107994 <- readRDS("clinical_107994_clean.rds")
+
+dim(clin_84076)   # should be 34 x 5
+
+clin_19439$group_harmonized  <- recode(as.character(clin_19439$group_status), "PTB" = "ATB")
+clin_19444$group_harmonized  <- recode(as.character(clin_19444$group_status), "PTB" = "ATB")
+clin_107994$group_harmonized <- recode(as.character(clin_107994$group_status),
+                                        "Active_TB" = "ATB", "LTBI_Progressor" = "LTBI")
+
+table(clin_84076$group_harmonized)   # confirm still clean, no re-derivation needed
+
+expr_84076 <- expr_84076[, clin_84076$sample_id]
+dim(expr_84076)   # should be genes x 34
+
+common_genes <- Reduce(intersect, list(
+  rownames(expr_19439), rownames(expr_19444),
+  rownames(expr_84076), rownames(expr_107994)
+))
+length(common_genes)   # should be 6739
+
+expr_19439_common  <- expr_19439[common_genes, ]
+expr_19444_common  <- expr_19444[common_genes, ]
+expr_84076_common  <- expr_84076[common_genes, ]
+expr_107994_common <- expr_107994[common_genes, ]
+
+dim(expr_84076_common)
+identical(colnames(expr_84076_common), clin_84076$sample_id)
+```
+
+## 7. Build the training pool and the held-out set
+
+Transpose to samples x genes (the layout mixOmics expects), stack the three training studies and set GSE19444 aside.
+
+```{r}
+## ---- 7. Transpose to samples x genes ----
+
+X_19439  <- t(expr_19439_common)
+X_19444  <- t(expr_19444_common)
+X_84076  <- t(expr_84076_common)
+X_107994 <- t(expr_107994_common)
+
+## ---- 7.1 Sanity check: sample order in each X matches its clin_* ----
+
+identical(rownames(X_19439),  clin_19439$sample_id)
+identical(rownames(X_19444),  clin_19444$sample_id)
+identical(rownames(X_84076),  clin_84076$sample_id)
+identical(rownames(X_107994), rownames(clin_107994))   # confirm which ID col applies for 107994
+
+## ---- 7.2 Build training pool: GSE19439 + GSE84076 + GSE107994 ----
+## GSE19444 held out entirely for external validation
+
+# Training pool = three studies stacked by row (samples x genes). GSE19444 stays out.
+X_train <- rbind(X_19439, X_84076, X_107994)
+
+Y_train <- factor(c(
+  clin_19439$group_harmonized,
+  clin_84076$group_harmonized,
+  clin_107994$group_harmonized
+), levels = c("Control", "LTBI", "ATB"))
+
+study_train <- factor(c(
+  rep("GSE19439",  nrow(X_19439)),
+  rep("GSE84076",  nrow(X_84076)),
+  rep("GSE107994", nrow(X_107994))
+))
+
+## ---- 7.3 Confirm alignment ----
+
+nrow(X_train) == length(Y_train)
+nrow(X_train) == length(study_train)
+
+table(Y_train, study_train)
+
+## ---- 7.4 External validation set: GSE19444 ----
+
+X_valid <- X_19444
+Y_valid <- factor(clin_19444$group_harmonized, levels = c("Control", "LTBI", "ATB"))
+
+```
+
+## 8. Study-aware PCA: coloured by disease group
+
+Unsupervised view of the training pool before any modelling (Figure 2).
+
+```{r}
+
+## ---- 8.1 (revised) PCA coloured by outcome, cleaned up ----
+
+# study = study_train: each study is centred and scaled separately inside mint.pca.
+pca_mint <- mint.pca(X_train, ncomp = 3, study = study_train)
+
+plotIndiv(
+  pca_mint,
+  group = Y_train,
+  ind.names = FALSE,      # turn off sample ID labels
+  legend = TRUE,
+  point.lwd = 0.5,
+  cex = 1.5,
+  title = "MINT PCA - coloured by disease group"
+)
+
+```
+MINT PCA was performed on the pooled training data (GSE19439, GSE84076, and GSE107994; n = 251) to visualise overall sample structure prior to supervised modelling. The first two components explained 23% and 18% of the total variance, respectively. Partial separation by disease group was observed along PC1, with active tuberculosis (ATB) samples trending toward higher PC1 values and greater spread along PC2, while Control and LTBI samples showed substantial overlap in the central region of the ordination. This pattern is consistent with the greater transcriptional similarity expected between non-active disease states (Control, LTBI) relative to active disease, and mirrors the group-level clustering patterns observed independently within the GSE84076 and GSE107994 preprocessing pipelines. The presence of partial, rather than complete, separation indicates real biological signal is captured within the pooled dataset, providing a reasonable basis for supervised sparse modelling (MINT sPLS-DA).
+
+
+## 8b. Study-aware PCA: coloured by study
+
+Same ordination, coloured by study.
+
+```{r}
+
+## ---- 8.2 (revised) PCA coloured by study, cleaned up ----
+
+plotIndiv(
+  pca_mint,
+  group = study_train,
+  ind.names = FALSE,
+  legend = TRUE,
+  point.lwd = 0.5,
+  cex = 1.5,
+  title = "MINT PCA - coloured by study"
+)
+```
+The same MINT PCA ordination was examined with samples coloured by originating study (GSE19439, GSE84076, GSE107994) to assess the extent of between-study technical variation prior to supervised modelling. Samples from all three training studies showed substantial overlap across the PC1–PC2 space, rather than forming distinct, non-overlapping clusters by study. This indicates that platform- and cohort-specific technical variation was not the dominant source of variance captured by the first two components, and that shared biological structure exists across studies within this reduced dimensional space. This supports the suitability of the pooled dataset for MINT integration, which explicitly models study as a source of variation during component construction, allowing shared disease-associated signal to be identified while accounting for residual between-study differences not fully resolved at the PCA stage.
+
+
+## 9. Flat three-class model, all 6 739 genes: tuning
+
+Choose the number of components and genes per component by LOGOCV, using balanced error rate (BER).
+
+```{r}
+
+## ---- 9. Tune MINT sPLS-DA (LOGOCV across the 3 training studies) ----
+
+# tune.mint.splsda uses leave-one-group-out CV: each fold holds out one whole study.
+tune_result <- tune.mint.splsda(
+  X = X_train,
+  Y = Y_train,
+  study = study_train,
+  ncomp = 5,
+  test.keepX = seq(10, 100, 10),
+  dist = "max.dist",
+  measure = "BER",     # balanced error rate 
+  scale = TRUE
+)
+
+## ---- 9.1 Inspect results ----
+
+plot(tune_result)
+
+tune_result$choice.ncomp
+tune_result$choice.keepX
+```
+Tuning of the MINT sPLS-DA model was performed using leave-one-group-out cross-validation (LOGOCV) across the three training studies (GSE19439, GSE84076, GSE107994), evaluating balanced error rate (BER) across combinations of number of components (1–5) and number of selected features per component (10–100). Model performance improved as additional components were included, with the lowest average BER (≈0.42) achieved using all five components at 10 selected features per component. Because LOGOCV in this context deterministically leaves out one whole study per fold rather than drawing repeated random subsamples, standard deviation could not be estimated across folds, and the automated component-selection procedure (which relies on this variability to test whether additional components significantly improve performance) could not be applied reliably. The final number of components and features per component was therefore selected directly from the tuning curve rather than the automated output, using ncomp = 5 and keepX = 10 per component, corresponding to the point of lowest observed balanced error rate.
+
+
+## 10. Flat model, all genes: fit
+
+Fit the model with the settings read from the tuning curve.
+
+```{r}
+## ---- 10. Fit final MINT sPLS-DA model using tuned settings ----
+
+final_keepX <- rep(10, 5)   # 10 genes per component, 5 components (from tuning plot)
+
+final_mint_model <- mint.splsda(
+  X = X_train,
+  Y = Y_train,
+  study = study_train,
+  ncomp = 5,
+  keepX = final_keepX ,
+  scale = TRUE 
+)
+
+## ---- 10.1 Diagnostic checks ----
+
+final_mint_model$ncomp
+final_mint_model$keepX
+
+# Confirm the model ran on the expected data dimensions
+dim(final_mint_model$X)
+length(final_mint_model$Y)
+```
+
+## 11. Flat model, all genes: sample plot
+
+Training samples on the first two components.
+
+```{r}
+## ---- 11. Visualize final model - sample plot on components 1 & 2 ----
+
+plotIndiv(
+  final_mint_model,
+  study = "global",
+  group = Y_train,
+  legend = TRUE,
+  ind.names = FALSE,
+  title = "Final MINT sPLS-DA - training data, components 1 & 2"
+)
+```
+Following model fitting, sample projections onto the first two MINT components (X-variate 1: 15% explained variance; X-variate 2: 6% explained variance) were examined to assess whether the sparse, supervised components captured disease-relevant structure beyond what was visible in the unsupervised PCA. Active tuberculosis (ATB) samples separated more clearly from Control and LTBI samples along X-variate 1 relative to the unsupervised ordination, while Control and LTBI samples continued to show substantial overlap, consistent with their greater underlying transcriptional similarity. Samples from all three training studies were interspersed throughout the ordination rather than forming distinct clusters by study, indicating that the model was not primarily capturing study-specific technical variation, consistent with successful between-study correction by the MINT framework.
+
+## 12. Flat model, all genes: external validation
+
+Predict the held-out cohort (GSE19444), which was not used for fitting or tuning.
+
+```{r}
+## ---- 12. Predict on the held-out external validation set (GSE19444) ----
+
+predictions <- predict(
+  final_mint_model,
+  newdata = X_valid,
+  study.test = factor(rep("GSE19444", nrow(X_valid)))
+)
+
+## ---- 12.1 Extract predicted classes at the final component ----
+
+predicted_class <- predictions$class$max.dist[, 5]   # using all 5 components
+
+## ---- 12.2 Confusion matrix ----
+
+conf_matrix <- table(
+  Predicted = predicted_class,
+  Actual    = Y_valid
+)
+
+conf_matrix
+
+## ---- 12.3 (fixed) Per-class accuracy and BER, with aligned factor levels ----
+
+# Force predicted_class to use the SAME level order as Y_valid,
+# so rows and columns of the confusion matrix correspond correctly
+predicted_class <- factor(predicted_class, levels = levels(Y_valid))
+
+conf_matrix <- table(
+  Predicted = predicted_class,
+  Actual    = Y_valid
+)
+
+conf_matrix   # rows and columns should now both read Control, LTBI, ATB in the same order
+
+## ---- Per-class accuracy and BER ----
+
+class_acc <- diag(conf_matrix) / colSums(conf_matrix)
+class_acc
+
+BER <- mean(1 - class_acc)
+BER
+
+overall_acc <- sum(diag(conf_matrix)) / sum(conf_matrix)
+overall_acc
+```
+The final MINT sPLS-DA model was evaluated on GSE19444, an entirely independent microarray cohort held out from all training and tuning steps. Predicted classifications achieved an overall accuracy of 53.7% and a balanced error rate (BER) of 0.444 across the three disease groups. Per-class accuracy was 66.7% for Control, 33.3% for LTBI, and 66.7% for ATB. The model therefore showed reasonable discriminative ability for Control and active tuberculosis (ATB), but performed considerably worse for LTBI, which was frequently misclassified as either Control or ATB. This pattern is consistent with the substantial overlap between Control and LTBI observed throughout exploratory analyses (PCA and training-data MINT ordination), and suggests that LTBI represents a transcriptionally intermediate or heterogeneous state that is more difficult to resolve as a distinct class using the current gene signature, rather than a failure specific to model tuning or study correction.
+
+
+Given the poor discrimination of LTBI in external validation, several refinements were explored to test whether this reflected a fixable modelling limitation rather than an inherent ceiling in the biological signal.
+
+## 14. limma filter on the training pool
+
+Test every gene for a difference between the three groups, using the training pool only.
+
+```{r}
+## ---- 14. Pre-filter genes using limma on the training pool ----
+
+
+
+# Design matrix for a 3-group comparison (Control/LTBI/ATB),
+# using only X_train / Y_train - GSE19444 is never touched here.
+
+design <- model.matrix(~ 0 + Y_train)
+colnames(design) <- levels(Y_train)
+
+# limma expects genes x samples, so transpose X_train back
+fit <- lmFit(t(X_train), design)
+
+# Test for any difference across the 3 groups (F-test, like ANOVA)
+contrast_matrix <- makeContrasts(
+  Control_vs_LTBI = Control - LTBI,
+  Control_vs_ATB  = Control - ATB,
+  LTBI_vs_ATB     = LTBI - ATB,
+  levels = design
+)
+
+fit2 <- contrasts.fit(fit, contrast_matrix)
+fit2 <- eBayes(fit2)
+
+## ---- 14.1 Rank genes by overall F-statistic (any group difference) ----
+
+top_genes <- topTable(fit2, number = Inf, sort.by = "F")
+
+## ---- 14.2 Diagnostic checks ----
+
+dim(top_genes)
+head(top_genes)
+
+# How many genes are significant at a reasonable threshold?
+sum(top_genes$adj.P.Val < 0.05)
+sum(top_genes$adj.P.Val < 0.01)
+```
+
+
+## 15. Keep the 208 filtered genes
+
+Subset training and held-out data to genes with adjusted p < 0.05, and save the objects.
+
+```{r}
+## ---- 15. Subset training and validation data to filtered genes ----
+
+# Use the FDR < 0.05 threshold (208 genes) as the filtered set.
+
+# NOTE: the filter is fitted once on all three training studies, outside the LOGOCV folds,
+# so the cross-validated error may be slightly optimistic (see Limitations in the report).
+filtered_genes <- rownames(top_genes)[top_genes$adj.P.Val < 0.05]
+
+length(filtered_genes)   # should be 208
+
+## ---- 15.1 Subset X_train and X_valid to filtered_genes ----
+
+X_train_filt <- X_train[, filtered_genes]
+X_valid_filt <- X_valid[, filtered_genes]
+
+## ---- 15.2 Diagnostic checks ----
+
+dim(X_train_filt)   # should be 251 x 208
+dim(X_valid_filt)   # should be 54 x 208
+
+identical(colnames(X_train_filt), colnames(X_valid_filt))
+
+## ---- 15.3 Save filtered objects for supplementary random-split comparison ----
+
+# These are saved so a separate supplementary document can perform a
+# random-split (70:30) validation comparison, as originally planned
+# before adopting MINT. This is a distinct, clearly-labelled
+# methodological comparison and does not modify or depend on the
+# main MINT pipeline above.
+
+saveRDS(X_train_filt, "X_train_filt.rds")
+saveRDS(Y_train, "Y_train.rds")
+saveRDS(study_train, "study_train.rds")
+saveRDS(X_valid_filt, "X_valid_filt.rds")
+saveRDS(Y_valid, "Y_valid.rds")
+saveRDS(filtered_genes, "filtered_genes.rds")
+
+## ---- Diagnostic check ----
+list.files(pattern = "_filt\\.rds$|^Y_train\\.rds$|^Y_valid\\.rds$|^study_train\\.rds$|^filtered_genes\\.rds$")
+```
+
+## 16. Flat model, 208 filtered genes: tuning
+
+Repeat the tuning on the filtered genes with a finer grid.
+
+```{r}
+## ---- 16. Re-tune MINT sPLS-DA on the filtered 208-gene set ----
+
+tune_result_filt <- tune.mint.splsda(
+  X = X_train_filt,
+  Y = Y_train,
+  study = study_train,
+  ncomp = 5,
+  test.keepX = seq(5, 100, 5),   # finer grid since fewer genes overall, and starting lower
+  dist = "max.dist",
+  measure = "BER" , 
+  scale = TRUE 
+)
+
+## ---- 16.1 Inspect results ----
+
+plot(tune_result_filt)
+
+tune_result_filt$choice.ncomp
+tune_result_filt$choice.keepX
+```
+Re-tuning on the filtered gene set via LOGOCV lowered the balanced error rate from ≈0.416 (full gene set) to ≈0.378, using three components (keepX = 80, 10, 50).
+
+
+## 17. Flat model, 208 filtered genes: fit
+
+Fit with the tuned settings (3 components; 80, 10 and 50 genes).
+
+```{r}
+## ---- 17. Fit final MINT sPLS-DA on filtered genes, improved settings ----
+
+final_mint_model_v2 <- mint.splsda(
+  X = X_train_filt,
+  Y = Y_train,
+  study = study_train,
+  ncomp = 3,
+  keepX = c(80, 10, 50) , 
+  scale = TRUE 
+)
+
+final_mint_model_v2$ncomp
+final_mint_model_v2$keepX
+```
+
+## 18. Compare prediction distances
+
+Maximum, centroids and Mahalanobis distance compared by LOGOCV.
+
+```{r}
+## ---- 18. Compare distance metrics via LOGOCV performance ----
+
+perf_v2 <- perf(
+  final_mint_model_v2,
+  dist = "all",     # evaluates max.dist, centroids.dist, and mahalanobis.dist together
+  progressBar = TRUE
+)
+
+## ---- 18.1 Inspect BER for each distance metric, at each component ----
+
+perf_v2$global.error$BER
+```
+Comparing prediction distance metrics via LOGOCV showed maximum distance outperformed centroids and Mahalanobis distance at every component count, confirming it as the appropriate choice (BER ≈ 0.378 vs. 0.439 and 0.413, respectively).
+
+
+
+
+## 19. Check a wider grid
+
+Test whether more genes per component would improve the BER.
+
+```{r}
+## ---- 19. Wider keepX grid check on filtered gene set ----
+
+tune_result_wide <- tune.mint.splsda(
+  X = X_train_filt,
+  Y = Y_train,
+  study = study_train,
+  ncomp = 3,          # keep at 3, since that's what the plot already identified as optimal
+  test.keepX = seq(10, 200, 10),
+  dist = "max.dist",
+  measure = "BER" , 
+  scale = TRUE 
+)
+
+plot(tune_result_wide)
+
+tune_result_wide$choice.keepX
+```
+Extending the keepX search range (10–200) did not improve on the previously identified optimum, confirming the original tuning grid had already captured the best-performing settings.
+ 
+
+## 20. Build the two-step (hierarchical) datasets
+
+Stage 1: ATB versus all other samples. Stage 2: Control versus LTBI among non-ATB samples.
+
+```{r}
+## ---- 20. Build hierarchical stage datasets ----
+
+## ---- Stage 1: ATB vs. everything else ----
+## Uses the full training pool - same X_train_filt, same samples
+
+# Stage 1 labels: ATB versus every other sample.
+Y_train_stage1 <- factor(
+  ifelse(Y_train == "ATB", "ATB", "Non_ATB"),
+  levels = c("Non_ATB", "ATB")
+)
+
+table(Y_train_stage1, study_train)
+
+## ---- Stage 2: Control vs. LTBI, ONLY among non-ATB training samples ----
+## Subset out ATB samples entirely for this stage
+
+non_atb_idx <- which(Y_train != "ATB")
+
+X_train_stage2     <- X_train_filt[non_atb_idx, ]
+Y_train_stage2      <- factor(as.character(Y_train[non_atb_idx]), levels = c("Control", "LTBI"))
+study_train_stage2  <- factor(as.character(study_train[non_atb_idx]))
+
+table(Y_train_stage2, study_train_stage2)
+
+## ---- Diagnostic checks ----
+
+dim(X_train_stage2)
+length(Y_train_stage2)
+length(study_train_stage2)
+```
+
+## 21. Stage 1 (ATB vs non-ATB): tuning
+
+LOGOCV tuning of genes per component.
+
+```{r}
+## ---- 21. Tune Stage 1: ATB vs. Non-ATB ----
+
+tune_stage1 <- tune.mint.splsda(
+  X = X_train_filt,
+  Y = Y_train_stage1,
+  study = study_train,
+  ncomp = 3,
+  test.keepX = seq(5, 100, 5),
+  dist = "max.dist",
+  measure = "BER" , 
+  scale = TRUE 
+)
+
+plot(tune_stage1)
+
+tune_stage1$choice.keepX
+```
+
+## 22. Stage 1: fit
+
+One component with 75 genes.
+
+```{r}
+## ---- 22. Fit Stage 1 model: ATB vs. Non-ATB ----
+
+stage1_model <- mint.splsda(
+  X = X_train_filt,
+  Y = Y_train_stage1,
+  study = study_train,
+  ncomp = 1,
+  keepX = 75 ,
+  scale = TRUE 
+)
+
+stage1_model$ncomp
+stage1_model$keepX
+```
+
+## 23. Stage 2 (Control vs LTBI): tuning
+
+LOGOCV tuning on the non-ATB samples.
+
+```{r}
+## ---- 23. Tune Stage 2: Control vs. LTBI ----
+
+tune_stage2 <- tune.mint.splsda(
+  X = X_train_stage2,
+  Y = Y_train_stage2,
+  study = study_train_stage2,
+  ncomp = 3,
+  test.keepX = seq(5, 100, 5),
+  dist = "max.dist",
+  measure = "BER" ,
+  scale = TRUE 
+)
+
+plot(tune_stage2)
+
+tune_stage2$choice.keepX
+```
+A hierarchical model was tested, motivated by ATB's clearer separation from Control/LTBI. Stage 1 (ATB vs. non-ATB) performed strongly (BER ≈ 0.138). Stage 2 (Control vs. LTBI only) performed poorly (BER ≈ 0.41), only modestly better than chance for a binary problem. This suggests the Control/LTBI overlap reflects a genuine biological/transcriptional limitation rather than an artifact of the three-class model design.
+
+## 24. Stage 2: fit
+
+Three components with 15, 40 and 20 genes.
+
+```{r}
+## ---- 24. Fit Stage 2 model: Control vs. LTBI ----
+
+stage2_model <- mint.splsda(
+  X = X_train_stage2,
+  Y = Y_train_stage2,
+  study = study_train_stage2,
+  ncomp = 3,
+  keepX = c(15, 40, 20) ,
+  scale = TRUE 
+)
+
+stage2_model$ncomp
+stage2_model$keepX
+```
+
+## 25. Two-step classifier: manual LOGOCV
+
+Both stages are refitted on two studies and applied in sequence to the third; the predictions of all three folds are pooled.
+
+```{r}
+## ---- 25. Manual LOGOCV for the combined hierarchical model ----
+
+studies <- levels(study_train)
+all_predictions <- vector("list", length(studies))
+names(all_predictions) <- studies
+
+# Each pass holds out one study, refits both stages on the other two and predicts the held-out study.
+for (s in studies) {
+
+  # Split into train (other 2 studies) / test (held-out study)
+  train_idx <- which(study_train != s)
+  test_idx  <- which(study_train == s)
+
+  X_tr <- X_train_filt[train_idx, ]
+  Y_tr <- Y_train[train_idx]
+  study_tr <- factor(as.character(study_train[train_idx]))
+
+  X_te <- X_train_filt[test_idx, ]
+  Y_te <- Y_train[test_idx]
+
+  ## ---- Stage 1: fit ATB vs Non-ATB on training studies ----
+  Y_tr_stage1 <- factor(ifelse(Y_tr == "ATB", "ATB", "Non_ATB"), levels = c("Non_ATB", "ATB"))
+
+  m1 <- mint.splsda(X = X_tr, Y = Y_tr_stage1, study = study_tr, ncomp = 1, keepX = 75)
+
+  pred1 <- predict(m1, newdata = X_te, study.test = factor(rep(s, nrow(X_te))))
+  pred1_class <- pred1$class$max.dist[, 1]
+
+  ## ---- Stage 2: fit Control vs LTBI on non-ATB training samples only ----
+  non_atb_tr <- which(Y_tr != "ATB")
+
+  X_tr_s2 <- X_tr[non_atb_tr, ]
+  Y_tr_s2 <- factor(as.character(Y_tr[non_atb_tr]), levels = c("Control", "LTBI"))
+  study_tr_s2 <- factor(as.character(study_tr[non_atb_tr]))
+
+  m2 <- mint.splsda(X = X_tr_s2, Y = Y_tr_s2, study = study_tr_s2, ncomp = 3, keepX = c(15, 40, 20))
+
+  ## ---- Apply Stage 2 only to samples Stage 1 predicted as Non_ATB ----
+  non_atb_te <- which(pred1_class == "Non_ATB")
+
+  final_pred <- rep("ATB", length(test_idx))  # default: Stage 1 said ATB
+
+  if (length(non_atb_te) > 0) {
+    pred2 <- predict(m2, newdata = X_te[non_atb_te, , drop = FALSE],
+                      study.test = factor(rep(s, length(non_atb_te))))
+    pred2_class <- pred2$class$max.dist[, 3]   # using all 3 components
+    final_pred[non_atb_te] <- as.character(pred2_class)
+  }
+
+  all_predictions[[s]] <- data.frame(
+    true = as.character(Y_te),
+    predicted = final_pred,
+    study = s
+  )
+}
+
+## ---- 25.1 Combine all folds and compute overall LOGOCV performance ----
+
+combined_results <- do.call(rbind, all_predictions)
+
+combined_results$predicted <- factor(combined_results$predicted, levels = c("Control", "LTBI", "ATB"))
+combined_results$true      <- factor(combined_results$true, levels = c("Control", "LTBI", "ATB"))
+
+conf_matrix_hier <- table(Predicted = combined_results$predicted, Actual = combined_results$true)
+conf_matrix_hier
+
+class_acc_hier <- diag(conf_matrix_hier) / colSums(conf_matrix_hier)
+class_acc_hier
+
+BER_hier <- mean(1 - class_acc_hier)
+BER_hier
+
+```
+To evaluate the hierarchical model as a complete pipeline, both stages were combined and assessed via manual LOGOCV: for each held-out study, Stage 1 and Stage 2 models were fitted on the remaining two studies and applied sequentially to predict held-out samples. The combined hierarchical approach achieved a balanced error rate of 0.368, a modest improvement over the flat three-class model (BER ≈ 0.378). Per-class accuracy was 56.8% for Control, 46.7% for LTBI, and 86.1% for ATB , ATB accuracy improved substantially relative to the flat model, and LTBI accuracy nearly doubled, while Control accuracy decreased slightly. This indicates that separating ATB out as an initial, more readily distinguishable decision meaningfully clarifies the subsequent Control-versus-LTBI classification, though the overall improvement remains modest and Control/LTBI discrimination continues to represent the primary limitation of the model.
+
+
+## 26. Sensitivity check: leave the Brazilian cohort out of Stage 1
+
+Not used in the final model; it shows whether the Brazilian cohort helps Stage 1.
+
+```{r}
+## ---- 26. LOGOCV sensitivity check: exclude GSE84076 entirely from Stage 1 (fixed) ----
+
+all_predictions_sens <- vector("list", length(studies))
+names(all_predictions_sens) <- studies
+
+for (s in studies) {
+
+  train_idx <- which(study_train != s)
+  test_idx  <- which(study_train == s)
+
+  X_tr <- X_train_filt[train_idx, ]
+  Y_tr <- Y_train[train_idx]
+  study_tr <- factor(as.character(study_train[train_idx]))
+
+  X_te <- X_train_filt[test_idx, ]
+  Y_te <- Y_train[test_idx]
+
+  ## ---- Stage 1: exclude GSE84076 UNLESS it's the held-out fold ----
+  if (s == "GSE84076") {
+    # GSE84076 already held out - nothing to exclude, use full training set
+    X_tr_s1 <- X_tr
+    Y_tr_s1_raw <- Y_tr
+    study_tr_s1 <- study_tr
+  } else {
+    keep_s1 <- which(study_tr != "GSE84076")
+    X_tr_s1 <- X_tr[keep_s1, ]
+    Y_tr_s1_raw <- Y_tr[keep_s1]
+    study_tr_s1 <- factor(as.character(study_tr[keep_s1]))
+  }
+
+  Y_tr_stage1 <- factor(ifelse(Y_tr_s1_raw == "ATB", "ATB", "Non_ATB"), levels = c("Non_ATB", "ATB"))
+
+  m1 <- mint.splsda(X = X_tr_s1, Y = Y_tr_stage1, study = study_tr_s1, ncomp = 1, keepX = 75)
+
+  pred1 <- predict(m1, newdata = X_te, study.test = factor(rep(s, nrow(X_te))))
+  pred1_class <- pred1$class$max.dist[, 1]
+
+  ## ---- Stage 2: unchanged, uses all non-ATB training samples (including GSE84076) ----
+  non_atb_tr <- which(Y_tr != "ATB")
+
+  X_tr_s2     <- X_tr[non_atb_tr, ]
+  Y_tr_s2     <- factor(as.character(Y_tr[non_atb_tr]), levels = c("Control", "LTBI"))
+  study_tr_s2 <- factor(as.character(study_tr[non_atb_tr]))
+
+  m2 <- mint.splsda(X = X_tr_s2, Y = Y_tr_s2, study = study_tr_s2, ncomp = 3, keepX = c(15, 40, 20))
+
+  non_atb_te <- which(pred1_class == "Non_ATB")
+  final_pred <- rep("ATB", length(test_idx))
+
+  if (length(non_atb_te) > 0) {
+    pred2 <- predict(m2, newdata = X_te[non_atb_te, , drop = FALSE],
+                      study.test = factor(rep(s, length(non_atb_te))))
+    pred2_class <- pred2$class$max.dist[, 3]
+    final_pred[non_atb_te] <- as.character(pred2_class)
+  }
+
+  all_predictions_sens[[s]] <- data.frame(
+    true = as.character(Y_te),
+    predicted = final_pred,
+    study = s
+  )
+}
+
+## ---- 26.1 Combine and compute performance ----
+
+combined_sens <- do.call(rbind, all_predictions_sens)
+combined_sens$predicted <- factor(combined_sens$predicted, levels = c("Control", "LTBI", "ATB"))
+combined_sens$true      <- factor(combined_sens$true, levels = c("Control", "LTBI", "ATB"))
+
+conf_matrix_sens <- table(Predicted = combined_sens$predicted, Actual = combined_sens$true)
+conf_matrix_sens
+
+class_acc_sens <- diag(conf_matrix_sens) / colSums(conf_matrix_sens)
+class_acc_sens
+
+BER_sens <- mean(1 - class_acc_sens)
+BER_sens
+```
+the smallest training study and the one with the thinnest ATB representation (n = 6)  was assessed by excluding it entirely from Stage 1 training via LOGOCV, except when it was itself the held-out fold. This resulted in a slightly higher balanced error rate (BER ≈ 0.381) compared to the model trained with GSE84076 included (BER ≈ 0.368), with per-class accuracy also marginally reduced across all three groups. This indicates that GSE84076 contributes net-positive information to the model despite its limited ATB representation, and it was therefore retained in all subsequent training.
+
+## 27. Two-step classifier on the held-out cohort
+
+The final Stage 1 and Stage 2 models predict GSE19444 once.
+
+```{r}
+## ---- 27. Final validation: hierarchical model on GSE19444 ----
+
+## ---- Stage 1: predict ATB vs Non_ATB on GSE19444 ----
+
+# The held-out cohort is predicted once by the final models; nothing is tuned on it.
+pred1_valid <- predict(
+  stage1_model,
+  newdata = X_valid_filt,
+  study.test = factor(rep("GSE19444", nrow(X_valid_filt)))
+)
+
+pred1_valid_class <- pred1_valid$class$max.dist[, 1]
+
+## ---- Stage 2: predict Control vs LTBI, only for samples Stage 1 called Non_ATB ----
+
+non_atb_valid <- which(pred1_valid_class == "Non_ATB")
+
+final_pred_valid <- rep("ATB", nrow(X_valid_filt))
+
+if (length(non_atb_valid) > 0) {
+  pred2_valid <- predict(
+    stage2_model,
+    newdata = X_valid_filt[non_atb_valid, , drop = FALSE],
+    study.test = factor(rep("GSE19444", length(non_atb_valid)))
+  )
+  pred2_valid_class <- pred2_valid$class$max.dist[, 3]
+  final_pred_valid[non_atb_valid] <- as.character(pred2_valid_class)
+}
+
+## ---- 27.1 Final confusion matrix and metrics ----
+
+final_pred_valid <- factor(final_pred_valid, levels = levels(Y_valid))
+
+conf_matrix_final <- table(Predicted = final_pred_valid, Actual = Y_valid)
+conf_matrix_final
+
+class_acc_final <- diag(conf_matrix_final) / colSums(conf_matrix_final)
+class_acc_final
+
+BER_final <- mean(1 - class_acc_final)
+BER_final
+
+overall_acc_final <- sum(diag(conf_matrix_final)) / sum(conf_matrix_final)
+overall_acc_final
+
+
+saveRDS(final_pred_valid, "final_pred_valid.rds")
+```
+The finalized hierarchical MINT sPLS-DA model was evaluated once on GSE19444, the fully independent external validation cohort untouched throughout training and tuning. The model achieved an overall accuracy of 61.1% and a balanced error rate of 0.393, an improvement over the original flat three-class model's external validation performance (BER ≈ 0.444). Per-class accuracy was 58.3% for Control, 47.6% for LTBI, and 76.2% for active tuberculosis (ATB). Both LTBI and ATB classification improved relative to the flat model, with LTBI showing the largest relative gain, consistent with the hierarchical structure's intended benefit of isolating ATB before addressing the more difficult Control-versus-LTBI distinction. Control classification declined marginally, suggesting that some of the residual Control/LTBI ambiguity persists even under the refined approach, reinforcing that this overlap likely reflects a genuine biological and transcriptional limitation rather than an artifact of model design.
+
+
+## 28. Stage 1: component-1 loadings
+
+Which genes drive the ATB versus non-ATB model.
+
+```{r}
+## ---- 28. Visualize gene contributions per component (Stage 1 and Stage 2) ----
+
+## ---- Stage 1: ATB vs Non-ATB (single component - use plotLoadings instead) ----
+
+plotLoadings(
+  stage1_model,
+  comp = 1,
+  contrib = "max",   # colour bars by which class each gene is most associated with
+  method = "median",
+  title = "Stage 1 (ATB vs Non-ATB) - gene loadings, component 1"
+)
+```
+Gene loadings for the Stage 1 model (ATB vs. Non-ATB) identified BATF2 as the strongest single contributor, a gene consistently reported in the tuberculosis blood transcriptomic signature literature as a top discriminator of active disease, supporting the biological plausibility of the model's gene selection. Other highly weighted genes included LHFPL2, MSRB2, PASK, SPTBN1, and SLC6A12 (ATB-associated), alongside ZBTB40 and SLC26A8 (Non-ATB-associated).
+
+
+## 28b. Stage 2: correlation circle
+
+Genes with the strongest correlation to components 1 and 2.
+
+```{r}
+## ---- 28.1 (revised) Stage 2 - improved plotVar with reduced clutter ----
+
+plotVar(
+  stage2_model,
+  comp = c(1, 2),
+  cutoff = 0.6,        # raised from 0.5 - fewer, more strongly-correlated genes shown
+  cex = 3,             # smaller label text (adjust up/down to taste)
+  title = "Stage 2 (Control vs LTBI) - gene contributions, components 1 & 2"
+)
+
+# ---- Get exact gene names and their component coordinates as a table ----
+
+stage2_var <- plotVar(stage2_model, comp = c(1, 2), cutoff = 0.6, plot = FALSE)
+
+stage2_var[order(stage2_var$x), c("names", "x", "y")]
+```
+
+The correlation circle for the Stage 2 model (Control vs. LTBI) revealed three distinct gene groupings across Components 1 and 2. The largest group, associated with negative Component 1 and near-neutral Component 2, comprised GPBAR1, ACP2, SDSL, FLVCR2, ASPHD2, RAB20, LHFPL2, and ATF3. A second group, associated with both negative Component 1 and strongly negative Component 2, comprised B3GNT8, MYBPC3, CCDC17, and ADCY4. A third group, associated with positive values on both components, comprised INPP4B, CD28, and ZNF331. This multi-axis structure is consistent with Stage 2 requiring three components during tuning, indicating that the Control/LTBI distinction is not captured by a single dominant gene expression axis, but involves at least two partially independent dimensions of variation.
+
+
+## 28c. Stage 2: component-1 loadings
+
+Direction of each gene in the Control versus LTBI model.
+
+```{r}
+## ---- 28.2 Also add a plotLoadings for Stage 2, component 1 (more directional/interpretable) ----
+
+plotLoadings(
+  stage2_model,
+  comp = 1,
+  contrib = "max",
+  method = "median",
+  title = "Stage 2 (Control vs LTBI) - gene loadings, component 1"
+)
+
+```
+
+Gene loadings for Stage 2 identified ZNF331 and SDSL as the two strongest contributors, associated with Control and LTBI respectively. C1QB and ATF3, both identified during the initial univariate gene filtering step (limma, FDR < 0.05), also appeared among the most highly weighted genes in the final sparse model, providing consistency between the preliminary filtering and the final MINT-selected signature.
+
+
+## 30. Exploratory Control vs ATB model: data and tuning
+
+Trained without LTBI samples; not part of the two-step classifier.
+
+```{r}
+## ---- 30. Build Control vs ATB dataset (exploratory, not part of core hierarchical model) ----
+
+control_atb_idx <- which(Y_train != "LTBI")
+
+X_train_ctrl_atb <- X_train_filt[control_atb_idx, ]
+Y_train_ctrl_atb <- factor(as.character(Y_train[control_atb_idx]), levels = c("Control", "ATB"))
+study_train_ctrl_atb <- factor(as.character(study_train[control_atb_idx]))
+
+## ---- 30.1 Diagnostic checks ----
+
+dim(X_train_ctrl_atb)
+table(Y_train_ctrl_atb, study_train_ctrl_atb)
+
+## ---- 31. Tune Control vs ATB model ----
+
+tune_ctrl_atb <- tune.mint.splsda(
+  X = X_train_ctrl_atb,
+  Y = Y_train_ctrl_atb,
+  study = study_train_ctrl_atb,
+  ncomp = 3,
+  test.keepX = seq(5, 100, 5),
+  dist = "max.dist",
+  measure = "BER" ,
+  scale = TRUE 
+)
+
+plot(tune_ctrl_atb)
+
+tune_ctrl_atb$choice.keepX
+
+```
+As a further exploratory comparison, a direct Control-versus-ATB model was built by excluding LTBI samples entirely from the training pool (n = 146). Tuned via LOGOCV, this model achieved a balanced error rate of approximately 0.128 using two components (keepX = 45, 5), a lower error rate than either the pooled ATB-versus-non-ATB model (Stage 1, BER ≈ 0.138) or the Control-versus-LTBI model (Stage 2, BER ≈ 0.41). This suggests that active tuberculosis is more readily distinguished from Control samples specifically than from the pooled non-ATB group, consistent with LTBI occupying an intermediate transcriptional position that makes the pooled non-ATB comparison marginally more difficult than the Control-only comparison.
+
+
+
+## 32. Control vs ATB: fit
+
+Two components with 45 and 5 genes.
+
+```{r}
+
+## ---- 32. Fit final Control vs ATB model ----
+
+ctrl_atb_model <- mint.splsda(
+  X = X_train_ctrl_atb,
+  Y = Y_train_ctrl_atb,
+  study = study_train_ctrl_atb,
+  ncomp = 2,
+  keepX = c(45, 5) ,
+  scale = TRUE 
+)
+
+ctrl_atb_model$ncomp
+ctrl_atb_model$keepX
+```
+
+
+## 33. Control vs ATB: component-1 loadings
+
+Genes driving the exploratory model.
+
+```{r}
+## ---- 33. Visualize gene contributions - Control vs ATB ----
+
+## ---- 33.1 plotLoadings - component 1 (most interpretable, directional) ----
+
+plotLoadings(
+  ctrl_atb_model,
+  comp = 1,
+  contrib = "max",
+  method = "median",
+  title = "Control vs ATB - gene loadings, component 1"
+)
+
+```
+Gene loadings for the Control-versus-ATB model identified BATF2 as the strongest contributor overall (ATB-associated), consistent with its emergence as the top gene in the Stage 1 (ATB vs. Non-ATB) model, reinforcing its role as a robust, comparison-independent marker of active disease across this dataset. RTP4, another gene frequently reported in tuberculosis blood transcriptomic signatures, also featured prominently among ATB-associated genes. On the Control side, SDSL emerged as the strongest contributor; notably, SDSL also featured prominently in the Stage 2 (Control vs. LTBI) model as an LTBI-associated gene, suggesting it may reflect a more general signature of deviation from the Control state rather than a marker specific to either LTBI or ATB individually.
+
+
+
+## 33b. Control vs ATB: gene coordinates
+
+Saved as a CSV.
+
+```{r}
+## ---- 33.2 plotVar - both components, get exact coordinates as text (avoids clutter) ----
+
+ctrl_atb_var <- plotVar(ctrl_atb_model, comp = c(1, 2), cutoff = 0.6, plot = FALSE)
+
+ctrl_atb_var[order(ctrl_atb_var$x), c("names", "x", "y")]
+
+write.csv(ctrl_atb_var, "ctrl_atb_gene_coordinates.csv", row.names = FALSE)
+
+```
+
+## Heatmap: Stage 1 genes
+
+Expression of the Stage 1 genes across the training pool (Supplementary Figure S3).
+
+```{r}
+#| fig-width: 10
+#| fig-height: 12
+
+
+
+## ---- Extract selected genes ----
+stage1_genes <- selectVar(stage1_model, comp = 1)$name
+
+## ---- Order samples by group, so ATB and Non-ATB form clean blocks ----
+sample_order <- order(Y_train_stage1)
+
+heatmap_data <- t(X_train_filt[sample_order, stage1_genes])
+
+annotation_col <- data.frame(Group = Y_train_stage1[sample_order])
+rownames(annotation_col) <- rownames(X_train_filt)[sample_order]
+
+## ---- Explicit colours for the annotation bar ----
+ann_colors <- list(Group = c(Non_ATB = "steelblue", ATB = "firebrick"))
+
+## ---- Draw the heatmap ----
+pheatmap(
+  heatmap_data,
+  annotation_col = annotation_col,
+  annotation_colors = ann_colors,
+  cluster_cols = FALSE,        # samples ordered by group, not re-clustered
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  fontsize_row = 7,            # smaller font so 70+ gene names fit without overlapping
+  scale = "row",
+  clustering_method = "complete",
+  color = colorRampPalette(c("steelblue", "white", "firebrick"))(100),
+  breaks = seq(-3, 3, length.out = 101),   # clip extreme values so a few outlier cells don't wash out the colour scale
+  main = "Stage 1 (ATB vs Non-ATB) - Selected Genes"
+)
+
+```
+The clustered heatmap of Stage 1 selected genes (ATB vs. Non-ATB) showed clear separation into two major gene blocks with opposing expression patterns: one cluster (including FBXL16, ZNF831, ID3, EPHA4, and NDRG2) elevated in Non-ATB samples, and a second cluster (including BATF2, RTP4, ASPHD2, SLC6A12, and LHFPL2) elevated specifically in ATB samples, consistent with the gene loadings identified earlier. While the two sample groups showed broadly distinct expression profiles across these genes, some heterogeneity was visible within each group, consistent with the model's balanced error rate of approximately 0.138 rather than perfect discrimination
+
+
+
+## Heatmap: Stage 2 genes
+
+Expression of the Stage 2 genes across the Control and LTBI samples (Supplementary Figure S4).
+
+```{r}
+#| fig-width: 10
+#| fig-height: 14
+
+## ---- Extract selected genes across all 3 components (Stage 2 used ncomp=3) ----
+
+stage2_genes <- unique(c(
+  selectVar(stage2_model, comp = 1)$name,
+  selectVar(stage2_model, comp = 2)$name,
+  selectVar(stage2_model, comp = 3)$name
+))
+
+## ---- Order samples by group ----
+
+sample_order_s2 <- order(Y_train_stage2)
+
+heatmap_data_s2 <- t(X_train_stage2[sample_order_s2, stage2_genes])
+
+annotation_col_s2 <- data.frame(Group = Y_train_stage2[sample_order_s2])
+rownames(annotation_col_s2) <- rownames(X_train_stage2)[sample_order_s2]
+
+ann_colors_s2 <- list(Group = c(Control = "steelblue", LTBI = "darkorange"))
+
+## ---- Draw the heatmap ----
+
+pheatmap(
+  heatmap_data_s2,
+  annotation_col = annotation_col_s2,
+  annotation_colors = ann_colors_s2,
+  cluster_cols = FALSE,
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  fontsize_row = 7,
+  scale = "row",
+  clustering_method = "complete",
+  color = colorRampPalette(c("steelblue", "white", "firebrick"))(100),
+  breaks = seq(-3, 3, length.out = 101),
+  main = "Stage 2 (Control vs LTBI) - Selected Genes"
+)
+
+```
+In contrast to the Stage 1 heatmap, the Stage 2 (Control vs. LTBI) clustered heatmap showed no clear separation between the two groups: elevated expression (red) columns appeared scattered across both Control and LTBI samples rather than forming distinct group-associated blocks, and the majority of samples in both groups showed similar, largely neutral expression patterns across the selected genes. This visual result directly reflects the comparatively poor discriminative performance of the Stage 2 model (BER ≈ 0.41) and provides further visual confirmation that Control and LTBI samples are not well-separated by transcriptional signal within this gene panel, consistent with the biological interpretation offered throughout this analysis.
+
+
+
+
+## Heatmap: Control vs ATB genes
+
+Expression of the exploratory model genes.
+
+```{r}
+#| fig-width: 10
+#| fig-height: 10
+
+## ---- Extract selected genes across both components ----
+
+ctrl_atb_genes <- unique(c(
+  selectVar(ctrl_atb_model, comp = 1)$name,
+  selectVar(ctrl_atb_model, comp = 2)$name
+))
+
+## ---- Order samples by group ----
+
+sample_order_ca <- order(Y_train_ctrl_atb)
+
+heatmap_data_ca <- t(X_train_ctrl_atb[sample_order_ca, ctrl_atb_genes])
+
+annotation_col_ca <- data.frame(Group = Y_train_ctrl_atb[sample_order_ca])
+rownames(annotation_col_ca) <- rownames(X_train_ctrl_atb)[sample_order_ca]
+
+ann_colors_ca <- list(Group = c(Control = "steelblue", ATB = "firebrick"))
+
+## ---- Draw the heatmap ----
+
+pheatmap(
+  heatmap_data_ca,
+  annotation_col = annotation_col_ca,
+  annotation_colors = ann_colors_ca,
+  cluster_cols = FALSE,
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  fontsize_row = 7,
+  scale = "row",
+  clustering_method = "complete",
+  color = colorRampPalette(c("steelblue", "white", "firebrick"))(100),
+  breaks = seq(-3, 3, length.out = 101),
+  main = "Control vs ATB - Selected Genes"
+)
+
+```
+The Control-versus-ATB heatmap showed the clearest separation of the three models, consistent with its lowest balanced error rate (≈0.128). Two major gene clusters emerged with opposing, largely consistent expression patterns: one cluster (including CD1C, SPTBN1, CD28, BACH2, and ID3) elevated in Control samples, and a second cluster (including BATF2, RTP4, ATF3, SDSL, and SLC6A12) elevated in ATB samples. Compared to both the Stage 1 (ATB vs. Non-ATB) and Stage 2 (Control vs. LTBI) heatmaps, this comparison showed the most contiguous, well-defined separation between groups, reinforcing that active tuberculosis is most readily distinguished from Control specifically, among the three pairwise/grouped comparisons examined.
+
+Across all three comparisons, the degree of visual separation in the clustered heatmaps closely mirrored each model's balanced error rate: Control vs. ATB (BER ≈ 0.128) showed the cleanest, most contiguous group separation; Stage 1 (ATB vs. Non-ATB, BER ≈ 0.138) showed a similarly clear, if slightly less distinct, split; and Stage 2 (Control vs. LTBI, BER ≈ 0.41) showed no discernible group-associated pattern, with elevated expression scattered across both groups. This consistency between quantitative performance metrics and visual separation in the heatmaps provides converging evidence that active tuberculosis is transcriptionally distinct from both Control and LTBI states, whereas Control and LTBI remain difficult to distinguish using this gene signature.
+
+
+## 37. Consolidated gene list across the three models
+
+Genes selected by one, two or all three models; the 21 genes in all three are the shared set in the report.
+
+```{r}
+## ---- 37. Consolidated biomarker gene list across all models ----
+
+## ---- Stage 1: ATB vs Non-ATB (1 component) ----
+
+stage1_biomarkers <- data.frame(
+  Gene = selectVar(stage1_model, comp = 1)$name,
+  Component = 1,
+  Model = "Stage 1 (ATB vs Non-ATB)"
+)
+
+## ---- Stage 2: Control vs LTBI (3 components) ----
+
+stage2_biomarkers <- rbind(
+  data.frame(Gene = selectVar(stage2_model, comp = 1)$name, Component = 1, Model = "Stage 2 (Control vs LTBI)"),
+  data.frame(Gene = selectVar(stage2_model, comp = 2)$name, Component = 2, Model = "Stage 2 (Control vs LTBI)"),
+  data.frame(Gene = selectVar(stage2_model, comp = 3)$name, Component = 3, Model = "Stage 2 (Control vs LTBI)")
+)
+
+## ---- Control vs ATB (exploratory, 2 components) ----
+
+ctrl_atb_biomarkers <- rbind(
+  data.frame(Gene = selectVar(ctrl_atb_model, comp = 1)$name, Component = 1, Model = "Control vs ATB (exploratory)"),
+  data.frame(Gene = selectVar(ctrl_atb_model, comp = 2)$name, Component = 2, Model = "Control vs ATB (exploratory)")
+)
+
+## ---- Combine into one master table ----
+
+all_biomarkers <- rbind(stage1_biomarkers, stage2_biomarkers, ctrl_atb_biomarkers)
+
+## ---- 37.1 Diagnostic checks ----
+
+dim(all_biomarkers)
+table(all_biomarkers$Model)
+
+## ---- 37.2 Identify genes that appear across MULTIPLE models (cross-validated by independent comparisons) ----
+
+gene_counts <- table(all_biomarkers$Gene)
+recurring_genes <- names(gene_counts[gene_counts > 1])
+
+recurring_genes
+length(recurring_genes)
+
+## ---- 37.2.1 Check overlap patterns more precisely ----
+
+genes_stage1 <- selectVar(stage1_model, comp = 1)$name
+genes_ctrl_atb <- unique(c(selectVar(ctrl_atb_model, comp = 1)$name, selectVar(ctrl_atb_model, comp = 2)$name))
+genes_stage2 <- unique(c(selectVar(stage2_model, comp = 1)$name, selectVar(stage2_model, comp = 2)$name, selectVar(stage2_model, comp = 3)$name))
+
+## Genes shared between the two ATB-related models (expected overlap, less novel)
+intersect(genes_stage1, genes_ctrl_atb)
+
+## Genes shared between Stage 2 and EITHER ATB model (more genuinely independent overlap)
+intersect(genes_stage2, genes_stage1)
+intersect(genes_stage2, genes_ctrl_atb)
+
+## ---- 37.2.2 Genes appearing in ALL THREE independently-tuned models ----
+
+genes_in_all_three <- Reduce(intersect, list(genes_stage1, genes_stage2, genes_ctrl_atb))
+
+genes_in_all_three
+length(genes_in_all_three)
+```
+Comparison of the gene sets selected across all three independently-tuned models (Stage 1: ATB vs. Non-ATB; Stage 2: Control vs. LTBI; and the exploratory Control vs. ATB model) revealed substantial recurrence: of 200 total gene selections across all models, 64 unique genes were selected in more than one model. Notably, this overlap extended beyond models sharing a common outcome class. 33 genes were shared between Stage 2 and Stage 1, and 24 genes were shared between Stage 2 and the Control-vs-ATB model. Twenty-one genes (C1QB, LHFPL2, FLVCR2, ATF3, BCL11B, RAB20, ASPHD2, CD28, NELL2, RTP4, TCN2, LOXL3, GADD45G, DYRK2, ID3, SOCS1, BACH2, SDSL, GPBAR1, GAS6, and ACP2) were selected across all three independently-tuned models, representing the most consistently supported candidate biomarkers identified in this analysis. This broad recurrence suggests that much of the discriminative signal in this dataset reflects a shared, general axis of immune/transcriptional variation across the tuberculosis disease spectrum, rather than entirely distinct signatures for each pairwise comparison.
+
+
+
+## 37b. Save gene lists and model objects
+
+Files for the enrichment and per-gene AUC analyses.
+
+```{r}
+## ---- 37.3 Save the full table and gene lists ----
+
+write.csv(all_biomarkers, "biomarker_gene_list_full.csv", row.names = FALSE)
+write.csv(data.frame(Gene = recurring_genes), "biomarker_genes_recurring.csv", row.names = FALSE)
+write.csv(data.frame(Gene = genes_in_all_three), "biomarker_genes_all_three_models.csv", row.names = FALSE)
+
+## ---- 37.4 Save model objects for future biomarker/enrichment work ----
+
+saveRDS(stage1_model, "stage1_model.rds")
+saveRDS(stage2_model, "stage2_model.rds")
+saveRDS(ctrl_atb_model, "ctrl_atb_model.rds")
+saveRDS(all_biomarkers, "all_biomarkers.rds")
+saveRDS(genes_in_all_three, "genes_in_all_three.rds")
+
+
+```
+
+
