@@ -1,0 +1,426 @@
+---
+title: "Pathway and Enrichment Analysis of MINT Biomarker Signatures"
+format:
+  html:
+    self-contained: true
+    execute:
+      warning: false
+      message: false
+---
+
+
+# Pathway and enrichment analysis of the MINT biomarker signatures
+
+**What this file does.** It tests whether the genes selected by the MINT models are enriched for Gene Ontology (Biological Process) terms, using clusterProfiler. It covers the 21 genes shared by all three models, the full gene list of each model (Stage 1, Stage 2 and the exploratory Control vs ATB model), a comparison of selected genes with the original source studies, and a final set of enrichment runs for six gene sets against three background gene lists. It also builds the table of all 113 selected genes.
+
+**Role in the project:** downstream interpretation. It uses the saved model and gene-list objects, not the raw expression data.
+
+**Inputs** (made by `MINT_Integration_Pipeline`): `stage1_model.rds`, `stage2_model.rds`, `ctrl_atb_model.rds`, `all_biomarkers.rds` and `genes_in_all_three.rds`. The last two chunks also need `X_train` (the 6 739 shared genes) and `X_train_filt` (the 208 filtered genes) from the MINT session.
+
+**Outputs:** `GO_enrichment_core21genes.csv`, `comparison_original_studies.csv`, `Supplementary_Table_S3_all_genes.csv` (all 113 selected genes, with the models that chose them and their loadings) and `GO_terms_all_sets.csv` (enriched terms for every gene set and background).
+
+**Notes.**
+
+- The `setwd()` path in section 2 points to the author's computer and must be changed to run the file.
+- Two lines refer to objects that are not created in this file: `go_results_df` (section 3.3) and `go_enrich_readable` (the dot plot). Both need a small fix before the file runs from top to bottom.
+- The last two chunks use `X_train` and `X_train_filt`. `X_train_filt` is saved by the MINT file as `X_train_filt.rds`; `X_train` is not saved, so run them in the same session as the MINT file or rebuild it.
+- The text between chunks is a set of working notes. Where its wording differs from the report, the report is the reference.
+
+
+
+## 1. Setup
+
+```{r}
+## ---- 1. Setup ----
+
+# This document performs pathway/enrichment analysis on the biomarker
+# gene lists extracted from the final MINT models (Stage 1, Stage 2,
+# and the exploratory Control vs ATB model). This is a separate
+# analytical stage, using saved model/gene-list objects rather than
+# the raw expression data.
+
+library(clusterProfiler)   # enrichment analysis (GO, KEGG)
+library(org.Hs.eg.db)      # human gene annotation (for ID conversion)
+library(dplyr)
+library(ggplot2)
+library(enrichplot)
+library(stringr)
+```
+
+
+## 2. Load the saved objects
+
+Models and gene lists from the MINT file.
+
+```{r}
+## ---- 2. Load saved biomarker objects from main pipeline ----
+
+setwd("C:/Users/27826/Documents/HonoursProject")
+
+stage1_model <- readRDS("stage1_model.rds")
+stage2_model <- readRDS("stage2_model.rds")
+ctrl_atb_model <- readRDS("ctrl_atb_model.rds")
+all_biomarkers <- readRDS("all_biomarkers.rds")
+genes_in_all_three <- readRDS("genes_in_all_three.rds")
+
+## ---- 2.1 Diagnostic checks ----
+
+dim(all_biomarkers)
+length(genes_in_all_three)
+head(all_biomarkers)
+
+```
+
+## 3. GO enrichment: the 21 genes shared by all three models
+
+Gene symbols are converted to Entrez IDs, then tested for Biological Process terms.
+
+```{r}
+## ---- 3. GO enrichment analysis - core 21-gene shortlist ----
+
+## ---- Convert gene symbols to Entrez IDs (clusterProfiler needs these) ----
+
+entrez_ids <- bitr(
+  genes_in_all_three,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+)
+
+## ---- 3.1 Diagnostic checks ----
+
+dim(entrez_ids)
+entrez_ids
+
+## ---- 3.2 Run GO enrichment (Biological Process) ----
+
+go_enrich <- enrichGO(
+  gene = entrez_ids$ENTREZID,
+  OrgDb = org.Hs.eg.db,
+  ont = "BP",          # Biological Process (other options: "MF", "CC", "ALL")
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.2,
+  readable = TRUE      # convert Entrez IDs back to gene symbols in output
+)
+
+## ---- 3.3 View results ----
+
+head(as.data.frame(go_enrich), 20)
+# NOTE: go_results_df is not created in this file (as.data.frame(go_enrich) is what is shown above).
+write.csv(go_results_df, "GO_enrichment_core21genes.csv", row.names = FALSE)
+```
+Gene Ontology (Biological Process) enrichment analysis identified 21 significantly over-represented terms (adjusted p < 0.05) among the 21 genes selected across all three independently-tuned MINT models. The majority of these terms related to T-cell biology, including T cell selection (p.adj = 0.011), alpha-beta T cell activation (p.adj = 0.011), lymphocyte differentiation (p.adj = 0.011), regulation of CD4-positive alpha-beta T cell activation (p.adj = 0.011), regulatory T cell differentiation (p.adj = 0.041), and adaptive immune response based on somatic recombination of immunoglobulin-superfamily receptors (p.adj = 0.036). These terms were predominantly driven by five genes  CD28, LOXL3, SOCS1, BCL11B, and GAS6  each appearing across multiple enriched terms, with C1QB and BACH2 additionally contributing to the adaptive immune response term. This strong, consistent enrichment for T-cell differentiation and regulatory T-cell pathways is biologically coherent with tuberculosis pathogenesis, given the central role of CD4+ T-cell-mediated immunity in both control of latent infection and progression to active disease.
+
+The appearance of regulatory T cell differentiation and negative regulation of alpha-beta T cell activation/differentiation terms (driven by CD28, SOCS1 and LOXL3) is of interest, as regulatory T cells (Tregs) are reported to play a nuanced, sometimes double-edged role in tuberculosis: they can help limit inflammatory tissue damage, but excessive Treg activity has also been linked to impaired bacterial clearance and progression to active disease.
+
+
+## 3b. Dot plot of the shared-gene enrichment
+
+```{r}
+#| fig-width: 12
+#| fig-height: 8
+
+dotplot(
+  # NOTE: go_enrich_readable is not created in this file; go_enrich (readable = TRUE) is the object made in section 3.
+  go_enrich_readable,
+  showCategory = 10,    # fewer terms = more space per label
+  font.size = 10,
+  title = "Figure 1: GO Biological Process Enrichment - Core 21-Gene Set"
+)
+```
+Figure 1 shows the top 10 significantly enriched GO Biological Process terms among the 21-gene core biomarker set. Lymphocyte differentiation showed the strongest enrichment, involving 25% of the gene set with a low adjusted p-value. The remaining top terms were predominantly related to T-cell activation, differentiation, and regulation (alpha-beta T cell activation, regulation of lymphocyte differentiation, T cell differentiation, regulation of leukocyte differentiation, T cell selection, and CD4-positive alpha-beta T cell activation), collectively indicating that the core biomarker signature is strongly associated with adaptive, T-cell-mediated immune processes — consistent with the established central role of CD4+ T-cell immunity in tuberculosis pathogenesis and disease progression.
+
+
+## 4. Full gene list of each model
+
+Genes from all components of each model, converted to Entrez IDs.
+
+```{r}
+## ---- 4. Extract full gene lists per model ----
+
+genes_stage1 <- selectVar(stage1_model, comp = 1)$name
+
+genes_stage2 <- unique(c(
+  selectVar(stage2_model, comp = 1)$name,
+  selectVar(stage2_model, comp = 2)$name,
+  selectVar(stage2_model, comp = 3)$name
+))
+
+genes_ctrl_atb <- unique(c(
+  selectVar(ctrl_atb_model, comp = 1)$name,
+  selectVar(ctrl_atb_model, comp = 2)$name
+))
+
+length(genes_stage1)
+length(genes_stage2)
+length(genes_ctrl_atb)
+
+## ---- 4.1 Convert each gene list to Entrez IDs ----
+
+entrez_stage1 <- bitr(genes_stage1, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+entrez_stage2 <- bitr(genes_stage2, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+entrez_ctrl_atb <- bitr(genes_ctrl_atb, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+dim(entrez_stage1)
+dim(entrez_stage2)
+dim(entrez_ctrl_atb)
+```
+All of Stage 1 (75/75) and Control-vs-ATB (50/50) mapped fully; Stage 2 lost 8 genes (67/75)  similar mapping loss rate observed in preprocessing
+
+## 5. GO enrichment for each model
+
+```{r}
+## ---- 5. GO enrichment - Stage 1 (ATB vs Non-ATB) ----
+
+go_stage1 <- enrichGO(
+  gene = entrez_stage1$ENTREZID,
+  OrgDb = org.Hs.eg.db,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.2,
+  readable = TRUE
+)
+
+## ---- 5.1 GO enrichment - Stage 2 (Control vs LTBI) ----
+
+go_stage2 <- enrichGO(
+  gene = entrez_stage2$ENTREZID,
+  OrgDb = org.Hs.eg.db,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.2,
+  readable = TRUE
+)
+
+## ---- 5.2 GO enrichment - Control vs ATB ----
+
+go_ctrl_atb <- enrichGO(
+  gene = entrez_ctrl_atb$ENTREZID,
+  OrgDb = org.Hs.eg.db,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.2,
+  readable = TRUE
+)
+
+## ---- 5.3 Check how many significant terms each model returned ----
+
+nrow(as.data.frame(go_stage1))
+nrow(as.data.frame(go_stage2))
+nrow(as.data.frame(go_ctrl_atb))
+
+```
+GO Biological Process enrichment was performed separately on the full gene sets selected by each individual model. Stage 1 (ATB vs. Non-ATB, 75 genes) yielded 79 significantly enriched terms, and the Control-versus-ATB model (50 genes) yielded 25 significantly enriched terms. In contrast, Stage 2 (Control vs. LTBI, 67 genes) yielded no significantly enriched GO terms at the adjusted p < 0.05 threshold. This absence of biological pathway coherence for the Stage 2 gene set is consistent with its comparatively poor discriminative performance (BER ≈ 0.41) and lack of clear visual separation in the corresponding heatmap, providing a third, independent line of evidence that the genes distinguishing Control from LTBI in this dataset do not form as coherent or well-characterized a biological signature as those distinguishing active tuberculosis from other states.
+
+
+## 5b. Readable lists of the top terms
+
+```{r}
+## ---- 5.4 Stage 1 - clean printable table ----
+
+cat("=== STAGE 1 (ATB vs Non-ATB) - Top GO terms ===\n\n")
+
+stage1_df <- as.data.frame(go_stage1)
+
+for (i in 1:15) {
+  cat(stage1_df$Description[i], "| p.adj =", round(stage1_df$p.adjust[i], 5),
+      "| genes:", stage1_df$geneID[i], "\n\n")
+}
+## ---- 5.5 Control vs ATB - clean printable table ----
+
+cat("=== CONTROL vs ATB - Top GO terms ===\n\n")
+
+ctrl_atb_df <- as.data.frame(go_ctrl_atb)
+
+for (i in 1:15) {
+  cat(ctrl_atb_df$Description[i], "| p.adj =", round(ctrl_atb_df$p.adjust[i], 5),
+      "| genes:", ctrl_atb_df$geneID[i], "\n\n")
+}
+```
+Two additional genes contributing prominently to the ATB-related model enrichments have direct, specific support in the tuberculosis literature. CD274 (PD-L1), a key immune checkpoint molecule, has been shown to be overexpressed on T cells, NK cells, and macrophages in tuberculosis patients, where the PD-1/PD-L1 pathway directly inhibits M. tuberculosis-specific CD4+ T-cell function during active disease consistent with its appearance specifically in the ATB-related gene sets (Stage 1 and Control vs. ATB) and its absence from the Stage 2 (Control vs. LTBI) analysis, since T-cell exhaustion via this pathway is a feature specifically associated with active, rather than latent, infection. IL15, appearing across nearly all top-ranked enrichment terms in both ATB-related models, has an established role in promoting protective anti-mycobacterial immunity: M. tuberculosis has been shown to induce IL-15 expression in macrophages, and elevated IL-15 activity is associated with enhanced NK-cell numbers and CD8+ T-cell-mediated IFN-γ production, contributing to improved bacterial control in experimental models.
+
+Taken together, the enrichment analyses provide converging biological support for the gene signatures identified by the MINT models. Both the core 21-gene overlap set and the broader individual model gene sets showed strong, consistent enrichment for T-cell differentiation, activation, and regulatory T-cell processes  pathways centrally implicated in tuberculosis immunity and disease progression. This enrichment was substantially stronger and more extensive for the ATB-related models (Stage 1: 79 significant terms; Control vs. ATB: 25 significant terms) than for the Control-versus-LTBI comparison (Stage 2: no significant terms), mirroring the pattern already observed in model performance (balanced error rate) and heatmap visualization. Several individual genes driving these enrichments have direct, independently published support in the tuberculosis literature: BATF2 and C1QB as validated diagnostic biomarkers, RTP4 as an externally-validated hub gene, ATF3, SOCS1, ID3, and BACH2 with established mechanistic roles in TB immunology, and IL15 and CD274 (PD-L1) with well-characterised roles in anti-mycobacterial immunity and T-cell exhaustion during active disease, respectively. This convergence across three independent lines of evidence (predictive performance, visual sample separation, and biological pathway enrichment) suggests that active tuberculosis is associated with a distinct, well-characterised T-cell-mediated transcriptional signature, whereas the Control-versus-LTBI distinction reflects a comparatively subtle and less biologically resolved difference within this dataset.
+
+## 6. Comparison with the source studies and the wider literature
+
+Table of selected genes that have support in the original papers or the TB literature.
+
+```{r}
+## ---- Comparison with original source-study findings AND broader literature ----
+
+comparison_original_studies <- data.frame(
+  Gene = c("BATF2", "RTP4", "ATF3", "ASPHD2", "LHFPL2",
+           "ANKRD22", "CD274", "FBXO6", "SOCS1", "BACH2",
+           "ETV7", "NT5E", "C1QB", "IL15"),
+  Present_analysis = c(
+    "Top gene, all 3 models", "Core 21-gene set; top gene, Control vs ATB", "Core 21-gene set",
+    "Core 21-gene set", "Core 21-gene set",
+    "Recurring gene set", "Stage 1 / Control vs ATB", "Recurring gene set",
+    "GO enrichment driver gene", "Core 21-gene set",
+    "Recurring gene set", "Recurring gene set",
+    "Core 21-gene set", "GO enrichment driver gene, Stage 1 / Control vs ATB"
+  ),
+  Source = c(
+    "Source-study paper (Singhania et al. 2018)",
+    "Source-study paper (Singhania et al. 2018)",
+    "Source-study paper (Singhania et al. 2018)",
+    "Source-study paper (Singhania et al. 2018)",
+    "Source-study paper (Singhania et al. 2018)",
+    "Source-study papers (Singhania et al. 2018; de Araujo et al. 2016)",
+    "Source-study paper (Berry et al. 2010)",
+    "Source-study paper (Singhania et al. 2018)",
+    "Source-study paper (Berry et al. 2010)",
+    "Source-study paper (Singhania et al. 2018)",
+    "Source-study paper (de Araujo et al. 2016)",
+    "Source-study paper (de Araujo et al. 2016)",
+    "Broader literature (not one of the four source-study papers)",
+    "Broader literature (not one of the four source-study papers)"
+  ),
+  Role_in_cited_study = c(
+    "Hub gene, IFN/complement/myeloid module",
+    "Hub gene, IFN/complement/myeloid module",
+    "Hub gene, IFN/complement/myeloid module",
+    "Hub gene, IFN/complement/myeloid module",
+    "Hub gene, IFN/complement/myeloid module",
+    "Hub gene / candidate biomarker (13-gene candidate list)",
+    "Interferon-inducible transcript, active TB",
+    "Hub gene, IFN/complement/myeloid module",
+    "Interferon-inducible transcript, active TB",
+    "Component of final reduced 20-gene TB signature",
+    "Candidate biomarker, TB vs Control/LTBI (13-gene list)",
+    "Candidate biomarker, TB vs Control/LTBI (13-gene list)",
+    "Identified alongside BATF2 as a top-performing 3-gene biomarker combination",
+    "Established role in NK/CD8+ T-cell-mediated anti-mycobacterial immunity"
+  )
+)
+
+## ---- Make "recurring" vs "core" labels unambiguous ----
+
+comparison_original_studies$Present_analysis <- gsub(
+  "Recurring gene set",
+  "Recurring gene set (2 of 3 models)",
+  comparison_original_studies$Present_analysis
+)
+
+comparison_original_studies$Present_analysis <- gsub(
+  "Core 21-gene set",
+  "Core gene set (3 of 3 models)",
+  comparison_original_studies$Present_analysis
+)
+
+## ---- Diagnostic check ----
+comparison_original_studies
+
+## ---- Formatted table for rendered document ----
+library(knitr)
+kable(
+  comparison_original_studies,
+  col.names = c("Gene", "Role in present analysis", "Source", "Role in cited study"),
+  caption = "Genes from the present MINT-derived biomarker signature with independent support in the literature, including the original studies underlying the source datasets"
+)
+
+## ---- Save for reference ----
+write.csv(comparison_original_studies, "comparison_original_studies.csv", row.names = FALSE)
+```
+Of the 200 total gene selections across the three independently-tuned models (Stage 1, Stage 2, and the exploratory Control-vs-ATB model), 64 genes were selected by two or more models ("recurring gene set"), and a further 21 genes were selected by all three models ("core gene set"), representing progressively stronger levels of cross-model support. The table above compares genes from these sets against findings reported in the original studies underlying the four source datasets, as well as broader tuberculosis biomarker literature.
+
+
+## 7. Table of all selected genes, and enrichment with a background list
+
+Builds `Supplementary_Table_S3_all_genes.csv` (113 genes) and tests enrichment against the 6 739 analysed genes as background.
+
+```{r}
+# Step 1: collect the genes each model selected (uses the fitted model objects)
+library(mixOmics); library(dplyr); library(clusterProfiler); library(org.Hs.eg.db)
+
+get_sel <- function(model, label) {
+  # one row per gene per component, with its loading
+  bind_rows(lapply(seq_len(model$ncomp), function(k) {
+    v <- selectVar(model, comp = k)$value
+    data.frame(gene = rownames(v), comp = k, loading = v$value.var, model = label)
+  }))
+}
+sel <- bind_rows(
+  get_sel(stage1_model,   "ATB_vs_nonATB"),
+  get_sel(stage2_model,   "Control_vs_LTBI"),
+  get_sel(ctrl_atb_model, "Control_vs_ATB")
+)
+
+# Step 2: one row per unique gene, flag which models picked it, name its Venn region
+gene_tab <- sel %>%
+  group_by(gene) %>%
+  summarise(
+    ATB_vs_nonATB   = any(model == "ATB_vs_nonATB"),
+    Control_vs_LTBI = any(model == "Control_vs_LTBI"),
+    Control_vs_ATB  = any(model == "Control_vs_ATB"),
+    components = paste0(model, ":comp", comp, collapse = "; "),
+    loadings   = paste0(round(loading, 3), collapse = "; "),
+    .groups = "drop") %>%
+  mutate(n_models = ATB_vs_nonATB + Control_vs_LTBI + Control_vs_ATB,
+         region = case_when(
+           n_models == 3 ~ "All three models (21 shared genes)",
+           n_models == 2 ~ "Two models (recurring)",
+           TRUE          ~ "One model only")) %>%
+  arrange(desc(n_models), gene)
+# Sanity check: 113 unique genes in total, 21 of them in all three models.
+stopifnot(nrow(gene_tab) == 113, sum(gene_tab$n_models == 3) == 21)  # sanity check
+write.csv(gene_tab, "Supplementary_Table_S3_all_genes.csv", row.names = FALSE)
+
+# Step 3: GO enrichment for the other genes, with the 6,739 analysed genes as universe
+# X_train comes from the MINT session (not saved as an .rds file).
+universe <- colnames(X_train)   # the 6,739 common genes
+run_go <- function(genes) enrichGO(genes, OrgDb = org.Hs.eg.db, keyType = "SYMBOL",
+  ont = "BP", pAdjustMethod = "BH", pvalueCutoff = 0.05, universe = universe)
+go_other     <- run_go(gene_tab$gene[gene_tab$n_models < 3])   # all non-shared genes
+go_recurring <- run_go(gene_tab$gene[gene_tab$n_models == 2])  # recurring only
+go_shared    <- run_go(gene_tab$gene[gene_tab$n_models == 3])  # re-run with the proper universe
+sapply(list(other = go_other, recurring = go_recurring, shared = go_shared),
+       function(x) nrow(as.data.frame(x)))
+```
+
+## 8. Enrichment of six gene sets against three backgrounds
+
+Default background, the 6 739 analysed genes and the 208 filtered genes. Writes `GO_terms_all_sets.csv`.
+
+```{r}
+# Step 1: gene sets to test (gene_tab comes from the previous chunk)
+library(clusterProfiler); library(org.Hs.eg.db)
+sets <- list(
+  ATB_vs_nonATB   = gene_tab$gene[gene_tab$ATB_vs_nonATB],
+  Control_vs_LTBI = gene_tab$gene[gene_tab$Control_vs_LTBI],
+  Control_vs_ATB  = gene_tab$gene[gene_tab$Control_vs_ATB],
+  Shared_21       = gene_tab$gene[gene_tab$n_models == 3],
+  Recurring       = gene_tab$gene[gene_tab$n_models == 2],
+  Other_nonshared = gene_tab$gene[gene_tab$n_models < 3]
+)
+
+# Step 2: three backgrounds - default (all annotated), the 6,739 analysed genes,
+# and the 208 limma-filtered genes the models actually chose from
+# X_train and X_train_filt come from the MINT session.
+universes <- list(
+  default   = NULL,
+  analysed  = colnames(X_train),
+  filtered  = colnames(X_train_filt)
+)
+
+# Step 3: same settings as the model-level enrichment in section 5 (BP, p.adj < 0.05, q < 0.2)
+run_go <- function(genes, univ) enrichGO(genes, OrgDb = org.Hs.eg.db, keyType = "SYMBOL",
+  ont = "BP", pAdjustMethod = "BH", pvalueCutoff = 0.05, qvalueCutoff = 0.2, universe = univ)
+
+res <- list()
+for (s in names(sets)) for (u in names(universes))
+  res[[paste(s, u, sep = "|")]] <- as.data.frame(run_go(sets[[s]], universes[[u]]))
+
+# Step 4: summary table (n terms per set x background) and the term lists
+summ <- data.frame(key = names(res), n_terms = sapply(res, nrow))
+summ[c("set", "background")] <- do.call(rbind, strsplit(summ$key, "\\|"))
+print(reshape(summ[, c("set", "background", "n_terms")], idvar = "set",
+              timevar = "background", direction = "wide"))
+terms <- do.call(rbind, lapply(names(res), function(k) if (nrow(res[[k]]))
+  cbind(key = k, res[[k]][, c("Description", "GeneRatio", "p.adjust", "geneID")])))
+write.csv(terms, "GO_terms_all_sets.csv", row.names = FALSE)
+```
