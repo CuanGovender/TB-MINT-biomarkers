@@ -1,0 +1,13 @@
+# Data and intermediate objects (public data can be re-downloaded from GEO)
+*.rds
+*.RData
+*.rda
+*.tar
+*.gz
+*.xlsx
+
+# R and Quarto
+.Rhistory
+.Rproj.user/
+*_files/
+*.html
