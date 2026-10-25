@@ -1,0 +1,1035 @@
+---
+title: "GSE107994-RNASeq"
+author: "CuanGovender"
+html:
+    self-contained: true
+    execute:
+      warning: false
+      message: false
+---
+
+
+# GSE107994: Leicester whole-blood RNA-seq cohort (cleaning and QC)
+
+**What this file does.** It reads the GEO sample information and the supplementary raw count matrix for the Leicester cohort (GSE107994; 175 samples: Control, LTBI, LTBI progressor and active TB), builds a clinical table and a gene-by-sample count matrix, filters weakly expressed genes with edgeR, applies TMM normalisation, converts Ensembl identifiers to gene symbols, checks quality (library sizes, density, median expression and PCA) and saves the results.
+
+**Role in the project:** training cohort (Leicester RNA-seq) in the MINT integration.
+
+**Two versions of the filtered data are made from the same `filterByExpr` step:**
+
+- *Full set* (`dge_full`): every gene that passes `filterByExpr`, converted to log2 CPM with gene symbols. This is the matrix saved for MINT (`log2_cpm_full_107994.rds`).
+- *Top 12 000 set* (`dge`): the 12 000 most variable of those genes, used only for the QC plots in sections 7 and 8 and saved as `dge_107994_preprocessed.rds`.
+
+**Inputs:** GEO series matrix (downloaded by `getGEO`) and the supplementary count file `GSE107994_Raw_counts_Leicester_with_progressor_longitudinal.xlsx` (downloaded by `getGEOSuppFiles`; set the paths in section 2).
+
+**Outputs:** `log2_cpm_full_107994.rds` and `clinical_107994_clean.rds` (both read by `MINT_Integration_Pipeline`) and `dge_107994_preprocessed.rds` (QC only).
+
+**Notes.**
+
+- The paths in section 2 point to the author's computer and must be changed to run the file.
+- Section 8.5 (PCA cluster investigation) was previously commented out; it is now a code chunk. The low-PC1 cluster is defined as the 21 Active_TB samples with the lowest PC1 scores (see the comment in that chunk).
+- The text between chunks is a set of working notes. Where its wording differs from the report, the report is the reference.
+
+
+
+## 1. Setup
+
+Load the packages used below.
+
+```{r}
+# 1.SETUP
+library(GEOquery)
+library(readxl)
+library(dplyr)
+library(janitor)
+library(tidyr)
+library(ggplot2)
+library(edgeR)
+```
+
+
+## 1b. GEO sample information
+
+Download the series matrix; it holds the clinical information only.
+
+```{r}
+## ---- 1. Load dataset: GEO phenotype metadata ----
+
+# Download the GEO Series Matrix containing the sample metadata.
+# The expression matrix is provided separately as a supplementary file.
+
+gset_107994 <- getGEO(
+  "GSE107994",
+  GSEMatrix = TRUE,
+  getGPL = FALSE
+)
+
+if (length(gset_107994) > 1) {
+  idx <- grep("GPL20301", attr(gset_107994, "names"))
+} else {
+  idx <- 1
+}
+
+gset_107994 <- gset_107994[[idx]]
+
+# Extract sample phenotype metadata.
+
+pheno_107994 <- pData(gset_107994)
+
+## ---- Diagnostic checks ----
+
+dim(pheno_107994)
+
+unique(pheno_107994$platform_id)
+```
+
+## 2. Download the raw count matrix
+
+Supplementary Excel file with raw counts.
+
+```{r}
+## ---- 2. Load the RNA-seq count matrix (supplementary file) ----
+
+# Download the supplementary files containing the raw count matrix
+
+
+getGEOSuppFiles(
+  "GSE107994",
+  baseDir = "C:/Users/27826/Documents/HonoursProject/GSE107884"
+)
+
+# Load the raw RNA-seq count matrix.
+
+counts_rna_raw <- read_excel(
+  "C:/Users/27826/Documents/HonoursProject/GSE107884/GSE107994/GSE107994_Raw_counts_Leicester_with_progressor_longitudinal.xlsx"
+)
+
+## ---- Diagnostic checks ----
+
+dim(counts_rna_raw)
+
+counts_rna_raw[1:5, 1:5]
+
+head(counts_rna_raw[, 1:3])
+
+```
+
+## 2a. Inspect the gene annotation
+
+```{r}
+## ---- 2.1 Inspect gene annotations ----
+
+# Inspect the gene annotation supplied with the raw RNA-seq count
+# matrix prior to constructing the expression matrix.
+
+# Missing gene symbols
+
+sum(is.na(counts_rna_raw$Gene_name))
+sum(counts_rna_raw$Gene_name == "")
+
+# Missing gene IDs
+
+sum(is.na(counts_rna_raw$Genes))
+sum(counts_rna_raw$Genes == "")
+
+# Duplicated gene symbols
+
+sum(duplicated(counts_rna_raw$Gene_name))
+
+# Duplicated gene IDs
+
+sum(duplicated(counts_rna_raw$Genes))
+
+# Inspect the annotation columns
+
+head(
+  counts_rna_raw[, c(
+    "Genes",
+    "Gene_name",
+    "Gene_biotype"
+  )]
+)
+
+```
+
+## 3. Build the gene-by-sample matrix
+
+Duplicate gene symbols are averaged.
+
+```{r}
+## ---- 3. Construct gene expression matrix ----
+
+# Construct a gene × sample expression matrix from the processed
+# RNA-seq count table. Duplicate gene symbols are averaged to
+# produce a single expression profile per gene.
+
+expr_107994 <- counts_rna_raw |>
+  dplyr::select(
+    Gene_name,
+    4:178
+  ) |>
+  dplyr::group_by(Gene_name) |>
+  dplyr::summarise(
+    dplyr::across(
+      where(is.numeric),
+      ~mean(.x, na.rm = TRUE)
+    )
+  )
+
+# Convert to a matrix.
+
+gene_matrix_final_107994 <- as.matrix(
+  expr_107994[, -1]
+)
+
+rownames(gene_matrix_final_107994) <- expr_107994$Gene_name
+
+## ---- 3.1 Diagnostic checks ----
+
+cat(
+  "Genes retained:",
+  nrow(gene_matrix_final_107994),
+  "\n"
+)
+
+cat(
+  "Samples:",
+  ncol(gene_matrix_final_107994),
+  "\n"
+)
+
+dim(gene_matrix_final_107994)
+
+class(gene_matrix_final_107994)
+
+head(
+  gene_matrix_final_107994[, 1:5]
+)
+
+sum(is.na(gene_matrix_final_107994))
+
+```
+
+
+## 3b. Clinical metadata
+
+Clean the variable names and keep the sample-level variables, including the original authors' outlier flag.
+
+```{r}
+## ---- 3. Construct clinical metadata ----
+
+# Standardise the GEO phenotype metadata by cleaning variable names
+# and retaining only sample-level clinical variables.
+
+clin_107994 <- clean_names(pheno_107994) |>
+  dplyr::select(ends_with("_ch1")) |>
+  dplyr::rename_with(~ sub("_ch1$", "", .x))
+
+# Retain the clinical variables required for downstream quality
+# control and exploratory analyses.
+
+clin_107994 <- clin_107994 |>
+  dplyr::select(
+    group,
+    outlier,
+    ethnicity,
+    gender,
+    patient_id,
+    tb_disease_type,
+    smear_result,
+    timepoint_months,
+    visit_date,
+    birth_place,
+    uk_arrival_year,
+    age_at_baseline_visit
+  ) |>
+  dplyr::rename(
+    group_status = group,
+    outlier_flag = outlier
+  )
+
+# Convert age from character to numeric.
+
+clin_107994 <- clin_107994 |>
+  dplyr::mutate(
+    age_at_baseline_visit =
+      as.numeric(age_at_baseline_visit)
+  )
+
+# Separate ethnicity into a broad ethnic group and a specific
+# geographic origin.
+
+clin_107994 <- clin_107994 |>
+  tidyr::separate(
+    ethnicity,
+    into = c(
+      "ethnicity_broad",
+      "origin"
+    ),
+    sep = "_",
+    extra = "merge",
+    fill = "right"
+  )
+
+# Standardise inconsistent origin labels.
+
+clin_107994 <- clin_107994 |>
+  dplyr::mutate(
+    origin = gsub("^Africa_", "African_", origin),
+    origin = gsub("Afganistan", "Afghanistan", origin)
+  )
+
+# Standardise the broad ethnicity labels while preserving the
+# specific geographic origin.
+
+clin_107994$ethnicity_broad <- dplyr::case_when(
+  clin_107994$ethnicity_broad == "British" ~ "British",
+
+  clin_107994$ethnicity_broad == "South" ~
+    "South_Asian",
+
+  clin_107994$ethnicity_broad == "East" ~
+    "East_African",
+
+  clin_107994$ethnicity_broad == "Western" ~
+    "European",
+
+  clin_107994$ethnicity_broad == "Central" &
+    clin_107994$origin %in%
+    c("Europe_Germany", "Europe_Poland") ~
+    "European",
+
+  clin_107994$ethnicity_broad == "Central" &
+    clin_107994$origin == "Asia_Afghanistan" ~
+    "Central_Asian",
+
+  clin_107994$ethnicity_broad == "Central" &
+    clin_107994$origin == "African_Cameroon" ~
+    "Central_African",
+
+  TRUE ~ "Other"
+)
+
+# Convert categorical variables to factors.
+
+clin_107994 <- clin_107994 |>
+  dplyr::mutate(
+    group_status = factor(group_status),
+    outlier_flag = factor(outlier_flag),
+    gender = factor(gender),
+    tb_disease_type = factor(tb_disease_type),
+    smear_result = factor(smear_result),
+    birth_place = factor(birth_place),
+    ethnicity_broad = factor(ethnicity_broad)
+  )
+
+## ---- 3.1 Diagnostic checks ----
+
+# Confirm that missing origin values occur only for British
+# participants.
+
+table(is.na(clin_107994$origin))
+
+sum(
+  clin_107994$ethnicity_broad == "British" &
+    is.na(clin_107994$origin)
+)
+
+# Inspect cleaned ethnicity variables.
+
+unique(clin_107994$ethnicity_broad)
+
+unique(clin_107994$origin)
+
+# Inspect the cleaned clinical metadata.
+
+str(clin_107994)
+
+table(clin_107994$group_status)
+
+table(clin_107994$gender)
+
+table(clin_107994$outlier_flag)
+
+summary(clin_107994$age_at_baseline_visit)
+
+# Confirm that all remaining missing values correspond to the
+# origin variable.
+
+sum(is.na(clin_107994))
+
+
+```
+
+
+## 4. Match sample identifiers
+
+The GEO metadata use GSM accessions; the count matrix uses cohort sample names.
+
+```{r}
+## ---- 4. Match sample IDs between phenotype and expression data ----
+
+# The GEO phenotype metadata are indexed using GSM accession
+# numbers, whereas the supplementary RNA-seq count matrix uses
+# cohort sample names. A lookup table is therefore constructed to
+# align both datasets.
+
+# Create a lookup table:
+# cohort sample name -> GSM accession.
+
+title_to_gsm <- setNames(
+  rownames(pheno_107994),
+  pheno_107994$title
+)
+
+head(title_to_gsm)
+
+# Extract the sample columns from the raw count matrix
+# (excluding gene annotation columns).
+
+sample_cols <- colnames(counts_rna_raw)[-(1:3)]
+
+# Confirm that every sample name is present in the lookup table.
+
+all(sample_cols %in% names(title_to_gsm))
+
+setdiff(
+  sample_cols,
+  names(title_to_gsm)
+)
+
+# Rename the RNA-seq count matrix columns using the corresponding
+# GSM accession numbers.
+
+colnames(counts_rna_raw)[-(1:3)] <- title_to_gsm[sample_cols]
+
+# Confirm that the renamed count matrix matches the clinical
+# metadata.
+
+all(
+  colnames(counts_rna_raw)[-(1:3)] %in%
+    rownames(pheno_107994)
+)
+
+setdiff(
+  colnames(counts_rna_raw)[-(1:3)],
+  rownames(pheno_107994)
+)
+
+## ---- 4.1 Diagnostic checks ----
+
+cat(
+  "Clinical samples:",
+  nrow(clin_107994),
+  "\n"
+)
+
+cat(
+  "RNA-seq samples:",
+  length(colnames(counts_rna_raw)[-(1:3)]),
+  "\n"
+)
+
+identical(
+  rownames(clin_107994),
+  colnames(counts_rna_raw)[-(1:3)]
+)
+```
+
+## 5. Final raw count matrix
+
+```{r}
+## ---- 5. Construct raw count matrix ----
+
+# Construct a gene × sample count matrix from the supplementary
+# RNA-seq count table.
+
+gene_matrix_107994 <- counts_rna_raw |>
+  dplyr::select(-(1:3)) |>
+  as.matrix()
+
+# Use Ensembl gene IDs as row names.
+
+rownames(gene_matrix_107994) <- counts_rna_raw$Genes
+
+# Ensure counts are stored as numeric.
+
+storage.mode(gene_matrix_107994) <- "numeric"
+
+## ----  Diagnostic checks ----
+
+cat(
+  "Genes:",
+  nrow(gene_matrix_107994),
+  "\n"
+)
+
+cat(
+  "Samples:",
+  ncol(gene_matrix_107994),
+  "\n"
+)
+
+dim(gene_matrix_107994)
+
+class(gene_matrix_107994)
+
+head(gene_matrix_107994[,1:5])
+
+sum(is.na(gene_matrix_107994))
+```
+
+
+## 5a. Library sizes before filtering
+
+```{r}
+## ---- 5.1 Initial QC: Library size distribution ----
+
+# Calculate sequencing depth for each sample prior to filtering.
+
+library_sizes <- colSums(gene_matrix_107994)
+
+library_df <- data.frame(
+  Sample = names(library_sizes),
+  LibrarySize = library_sizes
+)
+
+ggplot(
+  library_df,
+  aes(
+    x = reorder(Sample, LibrarySize),
+    y = LibrarySize
+  )
+) +
+  geom_point(
+    colour = "steelblue",
+    size = 2
+  ) +
+  geom_hline(
+    yintercept = median(library_sizes),
+    linetype = "dashed",
+    colour = "red"
+  ) +
+  theme_classic() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  ) +
+  labs(
+    title = "Sequencing depth across samples",
+    x = "Samples",
+    y = "Library size"
+  )
+```
+Library sizes were examined prior to normalization to assess sequencing depth across samples. Total read counts ranged from approximately 12 million to 35 million reads per sample, with the majority of samples clustered between 18 and 27 million reads. Although moderate variation in sequencing depth was observed, no samples exhibited exceptionally low library sizes that would justify removal prior to downstream preprocessing. These differences in library size are expected for raw RNA-seq data and motivate the application of library-size normalization using the trimmed mean of M-values (TMM) method implemented in edgeR.
+
+
+## 5b. Exploratory PCA before filtering
+
+```{r}
+## ---- 5.2 Exploratory PCA: Top 1000 most variable genes ----
+
+# Calculate gene-wise variance from the raw counts.
+
+gene_var <- apply(gene_matrix_107994, 1, var)
+
+# Select the 1000 most variable genes.
+
+top1000 <- order(gene_var, decreasing = TRUE)[1:1000]
+
+pca_input <- gene_matrix_107994[top1000, ]
+
+# Perform PCA.
+
+pca_raw <- prcomp(
+  t(pca_input),
+  center = TRUE,
+  scale. = TRUE
+)
+
+# Percentage variance explained.
+
+pca_var <- round(
+  100 * (pca_raw$sdev^2 / sum(pca_raw$sdev^2)),
+  1
+)
+
+# Define colours for disease groups.
+
+group_rna <- factor(clin_107994$group_status)
+
+group_cols <- c(
+  "Control" = "#4DAF4A",
+  "LTBI" = "#377EB8",
+  "LTBI_Progressor" = "#FF7F00",
+  "Active_TB" = "#E41A1C"
+)
+
+# Plot PCA.
+
+par(mar = c(5, 4, 4, 8))
+
+plot(
+  pca_raw$x[,1],
+  pca_raw$x[,2],
+  col = group_cols[group_rna],
+  pch = 19,
+  xlab = paste0("PC1 (", pca_var[1], "%)"),
+  ylab = paste0("PC2 (", pca_var[2], "%)"),
+  main = "Exploratory PCA before normalization\nTop 1000 most variable genes"
+)
+
+legend(
+  "topright",
+  inset = c(-0.6, 0),
+  legend = levels(group_rna),
+  col = group_cols[levels(group_rna)],   # reorder to match legend labels
+  pch = 16,
+  xpd = TRUE,
+  bty = "n",
+  title = "Disease group"
+)
+
+```
+Principal component analysis (PCA) was performed on the 1,000 most variable genes using raw RNA-seq counts to explore overall sample structure prior to preprocessing. Samples showed substantial overlap between disease groups, with no obvious technical clustering. Active tuberculosis samples appeared more dispersed than the remaining groups
+
+
+
+
+
+## 6. Filter, normalise and map gene symbols
+
+Low-expression filter, then the full set (saved for MINT) and the top 12 000 set (QC only).
+
+```{r}
+## ---- 6. Filter lowly expressed genes ----
+
+# Create an edgeR DGEList object from the raw count matrix.
+
+dge <- edgeR::DGEList(
+  counts = gene_matrix_107994
+)
+
+# Filter genes with low counts using edgeR's recommended
+# filterByExpr() function. The grouping factor ensures that genes
+# expressed within at least one biological group are retained.
+
+# Counts are filtered in the raw count scale; group labels come from the clinical table.
+keep <- edgeR::filterByExpr(
+  dge,
+  group = clin_107994$group_status
+)
+
+# Apply the filter.
+
+dge <- dge[keep, , keep.lib.sizes = FALSE]
+
+## ---- 6.1 Diagnostic checks ----
+
+cat(
+  "Genes before filtering:",
+  nrow(gene_matrix_107994),
+  "\n"
+)
+
+cat(
+  "Genes retained after filtering:",
+  nrow(dge),
+  "\n"
+)
+
+cat(
+  "Genes removed:",
+  nrow(gene_matrix_107994) - nrow(dge),
+  "\n"
+)
+
+cat(
+  "Percentage retained:",
+  round(
+    100 * nrow(dge) / nrow(gene_matrix_107994),
+    1
+  ),
+  "%\n"
+)
+## ---- 6.1 Save full filterByExpr object (for MINT integration) ----
+# Branch point: this retains everything that passed filterByExpr(),
+# without the additional top-12000-variance cut used for standalone
+# QC/visualization. This "full" object feeds the cross-study gene
+# intersection for MINT; the existing top-12000 branch below is
+# kept unchanged for GSE107994-specific QC plots and DE work.
+
+dge_full <- dge  # dge here = post-filterByExpr, pre-variance-cut
+
+cat("Genes retained (filterByExpr only, full):", nrow(dge_full), "\n")
+
+
+
+## ---- 6.11 TMM + log2 CPM on the FULL gene set (for MINT) ----
+
+# TMM factors are stored in dge_full and used by cpm() in section 6.4.1.
+dge_full <- calcNormFactors(dge_full)
+
+
+
+## ---- 6.2 Variance filtering ----
+
+# Retain the 12,000 most variable genes after low-expression filtering.
+
+gene_var <- apply(dge$counts, 1, var)
+
+top12000 <- order(
+  gene_var,
+  decreasing = TRUE
+)[1:12000]
+
+dge <- dge[top12000, , keep.lib.sizes = FALSE]
+
+cat("Genes retained after variance filtering:",
+    nrow(dge), "\n")
+
+## ---- 6.3 Convert Ensembl Gene IDs to gene symbols ----
+# dge_full (built in 6.1, before the top-12000-variance cut) is the
+# object that feeds into log2_cpm_full and gets saved for MINT
+# integration.
+
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+
+ensembl_ids <- rownames(dge_full)
+
+# One Ensembl ID can map to several symbols; the first is used.
+gene_symbols <- mapIds(
+  org.Hs.eg.db,
+  keys = ensembl_ids,
+  column = "SYMBOL",
+  keytype = "ENSEMBL",
+  multiVals = "first"
+)
+
+## ---- 6.3.1 Diagnostic checks ----
+length(ensembl_ids)
+sum(is.na(gene_symbols))
+sum(!is.na(gene_symbols))
+sum(duplicated(gene_symbols[!is.na(gene_symbols)]))
+
+## ---- 6.4 Apply gene symbol mapping to dge_full and log2_cpm_full ----
+
+keep_mapped <- !is.na(gene_symbols)
+dge_full_symbols <- dge_full[keep_mapped, , keep.lib.sizes = FALSE]
+# Genes without a symbol were dropped just above.
+rownames(dge_full_symbols) <- gene_symbols[keep_mapped]
+
+## ---- 6.4.1 Collapse duplicate gene symbols ----
+
+# Log2 CPM with prior count 1; this is the matrix that enters MINT.
+log2_cpm_full_raw <- edgeR::cpm(dge_full_symbols, log = TRUE, prior.count = 1)
+
+library(dplyr)
+
+log2_cpm_full_df <- as.data.frame(log2_cpm_full_raw)
+log2_cpm_full_df$Gene <- rownames(log2_cpm_full_raw)
+
+log2_cpm_full_collapsed <- log2_cpm_full_df |>
+  group_by(Gene) |>
+  summarise(across(everything(), mean)) |>
+  ungroup()
+
+log2_cpm_full <- as.matrix(log2_cpm_full_collapsed[, -1])
+rownames(log2_cpm_full) <- log2_cpm_full_collapsed$Gene
+
+## ---- 6.4.2 Diagnostic checks ----
+dim(log2_cpm_full)
+sum(is.na(log2_cpm_full))
+head(rownames(log2_cpm_full))
+
+# Read by MINT_Integration_Pipeline.
+saveRDS(log2_cpm_full, "log2_cpm_full_107994.rds")
+```
+
+## 7. TMM normalisation (top 12 000 set)
+
+```{r}
+## ---- 7. TMM normalization ----
+
+# Calculate Trimmed Mean of M-values (TMM) normalization factors.
+# TMM corrects for differences in library composition between samples,
+# ensuring that gene expression values are comparable across the cohort.
+# The normalization factors are stored within the DGEList object and are
+# used in all subsequent edgeR analyses.
+
+dge <- calcNormFactors(dge)
+
+## ---- Diagnostic checks ----
+
+# Inspect the normalization factors.
+
+dge$samples
+summary(dge$samples$norm.factors)
+range(dge$samples$norm.factors)
+```
+
+## 8. Log2 CPM for QC plots
+
+Used for visualisation only; not used in the integration.
+
+```{r}
+## ---- 8. Calculate log2 CPM for visualization ----
+
+# Convert the TMM-normalized DGEList to log2 Counts Per Million
+# (logCPM). These values are generated solely for quality control,
+# visualization and exploratory analyses, and are not used for
+# downstream differential expression testing.
+
+log2_cpm <- edgeR::cpm(
+  dge,
+  log = TRUE,
+  prior.count = 1
+)
+
+## ---- Diagnostic checks ----
+
+cat(
+  "Dimensions:",
+  dim(log2_cpm)[1],
+  "genes x",
+  dim(log2_cpm)[2],
+  "samples\n"
+)
+
+cat(
+  "Range:",
+  round(range(log2_cpm), 2),
+  "\n"
+)
+
+summary(as.vector(log2_cpm))
+
+sum(is.infinite(log2_cpm))
+```
+
+
+## 8a. Median log2 CPM by group
+
+```{r}
+## ---- 8.1 QC: Median log2 CPM by disease group ----
+
+# Calculate the median log2 CPM for each sample following
+# TMM normalization.
+
+sample_summary <- data.frame(
+  Sample = colnames(log2_cpm),
+  Group = clin_107994$group_status,
+  Median = apply(log2_cpm, 2, median)
+)
+
+# Define disease group colours.
+
+group_cols <- c(
+  "Control" = "#4DAF4A",
+  "LTBI" = "#377EB8",
+  "LTBI_Progressor" = "#FF7F00",
+  "Active_TB" = "#E41A1C"
+)
+
+# Compare the median log2 CPM across disease groups.
+
+boxplot(
+  Median ~ Group,
+  data = sample_summary,
+  outline = FALSE,
+  col = group_cols,
+  main = "Median log2 CPM by disease group",
+  xlab = "Disease group",
+  ylab = "Median log2 CPM"
+)
+
+# Overlay individual samples.
+
+stripchart(
+  Median ~ Group,
+  data = sample_summary,
+  vertical = TRUE,
+  method = "jitter",
+  jitter = 0.15,
+  pch = 19,
+  col = adjustcolor("black", alpha.f = 0.6),
+  add = TRUE
+)
+```
+
+Following TMM normalization, the median log₂ CPM values were highly comparable across the four disease groups, with substantial overlap in the interquartile ranges and only minor differences in median expression. This indicates that the normalization procedure successfully reduced systematic differences in expression distributions between samples while preserving the overall structure of the dataset. A small number of samples displayed lower median expression than the remainder of their respective groups, but no widespread group-specific bias was observed, supporting the suitability of the dataset for downstream exploratory analyses and differential expression testing.
+
+
+## 8b. Density plot
+
+```{r}
+## ---- 8.2 QC: Density plot of TMM-normalized log2 CPM ----
+
+# Visualise the distribution of TMM-normalized log2 CPM values
+# across all samples.
+
+plotDensities(
+  log2_cpm,
+  col = group_cols[group_rna],
+  main = "Density of TMM-normalized log2 CPM",
+  legend = FALSE
+)
+
+legend(
+  "topright",
+  legend = levels(group_rna),
+  col = group_cols,
+  lty = 1,
+  lwd = 2,
+  bty = "n",
+  title = "Disease group",
+  cex = 0.8
+)
+
+
+
+
+```
+Following low-expression filtering and TMM normalization, the density distributions of the log₂ CPM values were highly consistent across all samples, indicating successful correction for differences in library composition while preserving the overall expression profiles. The remaining low-expression peak was substantially reduced after filtering, suggesting that genes with consistently low counts had largely been removed.
+
+
+## 8c. PCA of the 1 000 most variable genes
+
+Setup (8.3) and plot (8.4).
+
+```{r}
+
+## ---- 8.3 PCA setup ----
+
+# Perform PCA using the 1000 most variable genes after
+# low-expression filtering and TMM normalization.
+
+gene_var <- apply(log2_cpm, 1, var)
+
+top1000 <- order(
+  gene_var,
+  decreasing = TRUE
+)[1:1000]
+
+pca_norm <- prcomp(
+  t(log2_cpm[top1000, ]),
+  scale. = TRUE
+)
+
+pca_var <- round(
+  100 * (pca_norm$sdev^2 /
+           sum(pca_norm$sdev^2)),
+  1
+)
+
+## ---- 8.4 PCA: TMM-normalized log2 CPM ----
+
+group_rna <- factor(clin_107994$group_status)
+
+sample_cols <- group_cols[
+  as.character(group_rna)
+]
+
+par(mar = c(5, 4, 4, 8))
+
+plot(
+  pca_norm$x[, 1],
+  pca_norm$x[, 2],
+  col = sample_cols,
+  pch = 16,
+  xlab = paste0(
+    "PC1 (",
+    pca_var[1],
+    "%)"
+  ),
+  ylab = paste0(
+    "PC2 (",
+    pca_var[2],
+    "%)"
+  ),
+  main = paste(
+    "PCA of TMM-normalized",
+    "log2 CPM",
+    "\nTop 1000 most variable genes"
+  )
+)
+
+legend(
+  "topright",
+  inset = c(-0.6, 0),
+  legend = levels(group_rna),
+  col = group_cols[levels(group_rna)],   # reorder to match legend labels
+  pch = 16,
+  xpd = TRUE,
+  bty = "n",
+  title = "Disease group"
+)
+```
+
+PCA of the 1,000 most variable genes demonstrated partial separation of the disease groups, with LTBI Progressor samples tending to separate from the remaining groups along PC1, while Active TB samples clustered predominantly on the opposite side of the ordination. Control and LTBI samples exhibited greater overlap, consistent with their more similar transcriptional profiles. No obvious technical outliers were observed, indicating that the filtered and normalized dataset was suitable for downstream differential expression analysis.
+
+
+
+
+
+## 8d. PCA cluster investigation: severity and subgroup checks
+
+Tests whether the low-PC1 Active_TB cluster is explained by smear result, and inspects the three LTBI samples at high PC2.
+
+```{r}
+# The Active_TB group separates into a distinct cluster at low PC1.
+# Smear result was tested as a candidate explanatory variable.
+
+# Cluster = the 21 Active_TB samples with the lowest PC1 scores (21 of 53,
+# as reported in the text). The gap check below should show a clear break
+# between the 21st and 22nd sample.
+active_tb_all <- clin_107994[clin_107994$group_status == "Active_TB", ]
+pc1_active <- sort(pca_norm$x[rownames(active_tb_all), 1])
+outlier_ids_rna <- names(pc1_active)[1:21]
+pc1_active[19:24]
+
+outlier_meta_rna <- clin_107994[rownames(clin_107994) %in% outlier_ids_rna, ]
+
+table(rownames(active_tb_all) %in% outlier_ids_rna, active_tb_all$smear_result)
+fisher.test(table(rownames(active_tb_all) %in% outlier_ids_rna, active_tb_all$smear_result))
+
+# A separate small cluster of 3 LTBI samples was also identified at
+# high PC2 and checked against available clinical variables
+# (timepoint, disease type, ethnicity, origin, birth place, age).
+top3_ltbi_ids <- c("GSM2886333", "GSM2886306", "GSM2886301")
+clin_107994[rownames(clin_107994) %in% top3_ltbi_ids, ]
+
+ltbi_all <- clin_107994[clin_107994$group_status == "LTBI", ]
+table(rownames(ltbi_all) %in% top3_ltbi_ids, ltbi_all$tb_disease_type)
+```
+
+
+The Active_TB group formed a distinct cluster separated along PC1, comprising 21 of 53 Active_TB samples. Cross-referencing this cluster against clinical variables identified smear result as a significant predictor of cluster membership (Fisher's exact test, p = 0.018, OR = 4.6, 95% CI: 1.23–18.9), with smear-positive patients substantially over-represented relative to smear-negative patients. This is consistent with disease severity/bacterial burden driving transcriptional heterogeneity within the Active_TB group, mirroring the analogous finding of radiological grade-associated clustering observed in the GSE19444 microarray dataset. A separate, smaller cluster of three LTBI samples was also identified at high PC2 and checked against available clinical variables (timepoint, disease type, ethnicity, origin, birth place, arrival year, and age); no variable showed a clear distinguishing pattern, and this cluster was noted as unexplained given the small sample size (n = 3) rather than attributed to a specific cause.
+
+
+## 10. Save
+
+Section 9 does not exist; the numbering skips it.
+
+```{r include=FALSE}
+## ---- 10. Save analysis-ready objects ----
+
+saveRDS(
+  dge,
+  "dge_107994_preprocessed.rds"
+)
+
+saveRDS(
+  clin_107994,
+  "clinical_107994_clean.rds"
+)
+
+
+```
+
+
+
+
+
+
