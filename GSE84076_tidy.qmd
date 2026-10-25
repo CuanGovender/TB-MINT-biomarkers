@@ -1,0 +1,831 @@
+---
+title: "GSE107994"
+html:
+    self-contained: true
+    execute:
+      warning: false
+      message: false
+---
+
+
+
+
+# GSE84076: Brazilian whole-blood RNA-seq cohort (cleaning and QC)
+
+**What this file does.** It reads the processed RNA-seq expression matrix (normalised FPKM) and the GEO sample information for the Brazilian cohort (GSE84076; 36 samples: Control, LTBI, active TB and treated active TB). It builds a gene-by-sample matrix, repairs gene symbols that Excel turned into dates, builds the clinical table, removes weakly expressed genes, log2-transforms the values, checks quality (density, median expression and PCA) and saves the results.
+
+**Role in the project:** training cohort (Brazilian RNA-seq) in the MINT integration. The two treated active TB samples are still present in the saved files; they are removed in the MINT file (36 to 34 samples).
+
+**Inputs:** GEO series matrix (downloaded by `getGEO`) and the supplementary file `GSE84076_ExpressionDataMatrix.txt.gz`, which must be downloaded from GEO by hand (set the path in sections 2 and 3).
+
+**Outputs:** `gene_matrix_final_84076.rds` (genes x samples, filtered, FPKM scale) and `clin_84076.rds`. These are read by `MINT_Integration_Pipeline`.
+
+**Notes.**
+
+- The paths in sections 2 and 3 point to the author's computer and must be changed to run the file.
+- `gene_matrix_final_84076.rds` is written twice: once after the symbol repair (section 4, unfiltered) and again at the end (section 9, filtered). The final copy is the one used downstream, so run the whole file.
+- The saved matrix is on the FPKM scale. The log2(FPKM + 1) values (`log2_expr_84076`) are used for the QC plots only.
+- The text between chunks is a set of working notes. Where its wording differs from the report, the report is the reference.
+
+
+
+## 1. Setup
+
+Load the packages used below.
+
+```{r}
+# 1.SETUP
+library(GEOquery)
+library(readxl)
+library(dplyr)
+library(janitor)
+library(tidyr)
+library(ggplot2)
+library(matrixStats)
+
+```
+
+
+
+## 1b. GEO sample information
+
+Download the series matrix (platform GPL16791); it holds the clinical information only.
+
+```{r}
+
+## ---- 1. Load dataset: GEO phenotype/clinical metadata ----
+
+gset_84076 <- getGEO("GSE84076", GSEMatrix = TRUE, getGPL = FALSE)
+
+if (length(gset_84076) > 1) {
+  idx <- grep("GPL16791", attr(gset_84076, "names"))
+} else {
+  idx <- 1
+}
+
+gset_84076 <- gset_84076[[idx]]
+
+# Extract phenotype (clinical) metadata.
+pheno_84076 <- pData(gset_84076)
+
+# Diagnostic checks.
+dim(pheno_84076)
+
+unique(pheno_84076$platform_id)
+
+```
+
+## 2. Locate the supplementary expression file
+
+The expression values are not in the series matrix.
+
+```{r}
+
+## ---- 2. Locate supplementary expression matrix ----
+
+# The GEO Series Matrix for GSE84076 contains only phenotype
+# information. The processed RNA-seq expression matrix is supplied
+# separately as a GEO supplementary file and was downloaded
+# manually from the GEO repository.
+
+expr_file_84076 <-
+  "C:/Users/27826/Documents/HonoursProject/GSE84076/GSE84076/GSE84076_ExpressionDataMatrix.txt.gz"
+
+file.exists(expr_file_84076)
+
+```
+
+## 3. Import the processed RNA-seq matrix
+
+```{r}
+
+## ---- 3. Import processed RNA-seq expression matrix ----
+
+# GSE84076 does not contain expression values in the GEO Series Matrix.
+# The processed RNA-seq expression matrix is supplied separately as a
+# supplementary file and imported directly.
+
+expr_file_84076 <-
+  "C:/Users/27826/Documents/HonoursProject/GSE84076/GSE84076/GSE84076_ExpressionDataMatrix.txt.gz"
+
+expr_84076_raw <- read.delim(
+  gzfile(expr_file_84076),
+  header = TRUE,
+  sep = "\t",
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+# Diagnostic checks
+
+dim(expr_84076_raw)
+
+head(expr_84076_raw[, 1:5])
+
+colnames(expr_84076_raw)
+```
+
+## 3a. Inspect the gene annotation
+
+```{r}
+
+## ---- 3.1 Inspect gene annotations ----
+
+# Inspect the annotation supplied with the processed RNA-seq matrix
+# prior to constructing the expression matrix.
+
+# Missing gene symbols
+sum(is.na(expr_84076_raw$gene_short_name))
+sum(expr_84076_raw$gene_short_name == "")
+
+# Missing gene IDs
+sum(is.na(expr_84076_raw$gene_id))
+sum(expr_84076_raw$gene_id == "")
+
+# Duplicated gene symbols
+sum(duplicated(expr_84076_raw$gene_short_name))
+
+# Duplicated Ensembl gene IDs
+sum(duplicated(expr_84076_raw$gene_id))
+
+# Inspect the first few annotations
+head(expr_84076_raw[, c("gene_id", "gene_short_name", "locus")])
+
+```
+
+## 4. Build the gene-by-sample matrix and repair gene symbols
+
+Average duplicated symbols, then restore symbols that Excel converted to dates (for example `1-Mar` back to `MARCH1`).
+
+```{r}
+## ---- 4. Construct gene expression matrix ----
+
+# Construct a gene × sample expression matrix from the processed
+# RNA-seq data. Two duplicated gene symbols were identified during
+# annotation inspection and are averaged to produce a single
+# expression profile per gene.
+
+expr_84076 <- expr_84076_raw |>
+  dplyr::select(gene_short_name, 2:37) |>
+  dplyr::group_by(gene_short_name) |>
+  dplyr::summarise(
+    dplyr::across(
+      where(is.numeric),
+      ~mean(.x, na.rm = TRUE)
+    )
+  )
+
+# Convert to a matrix
+
+gene_matrix_final_84076 <- as.matrix(expr_84076[, -1])
+
+rownames(gene_matrix_final_84076) <- expr_84076$gene_short_name
+## ---- 4.1 Diagnostic checks ----
+
+cat("Genes retained:", nrow(gene_matrix_final_84076), "\n")
+cat("Samples:", ncol(gene_matrix_final_84076), "\n")
+
+dim(gene_matrix_final_84076)
+
+class(gene_matrix_final_84076)
+
+head(gene_matrix_final_84076[, 1:5])
+
+sum(is.na(gene_matrix_final_84076))
+
+
+## ---- 4.2 Fix Excel date-corrupted gene symbols ----
+
+# A known set of gene symbols (SEPT1-15, MARCH1-11, DEC1, etc.) get
+# auto-converted to date values when a spreadsheet passes through Excel.
+# This is a documented, recurring problem in genomics data
+# (Zeeberg et al. 2004) and affects the original GEO supplementary
+# file for this dataset, not anything introduced by this pipeline.
+
+date_to_gene <- c(
+  "1-Mar" = "MARCH1", "2-Mar" = "MARCH2", "3-Mar" = "MARCH3",
+  "4-Mar" = "MARCH4", "5-Mar" = "MARCH5", "6-Mar" = "MARCH6",
+  "7-Mar" = "MARCH7", "8-Mar" = "MARCH8", "9-Mar" = "MARCH9",
+  "10-Mar" = "MARCH10", "11-Mar" = "MARCH11",
+  "1-Sep" = "SEPT1", "2-Sep" = "SEPT2", "3-Sep" = "SEPT3",
+  "4-Sep" = "SEPT4", "5-Sep" = "SEPT5", "6-Sep" = "SEPT6",
+  "7-Sep" = "SEPT7", "8-Sep" = "SEPT8", "9-Sep" = "SEPT9",
+  "10-Sep" = "SEPT10", "11-Sep" = "SEPT11", "12-Sep" = "SEPT12",
+  "13-Sep" = "SEPT13", "14-Sep" = "SEPT14", "15-Sep" = "SEPT15",
+  "1-Dec" = "DEC1"
+)
+
+current_names <- rownames(gene_matrix_final_84076)
+
+fixed_names <- ifelse(
+  current_names %in% names(date_to_gene),
+  date_to_gene[current_names],
+  current_names
+)
+
+## ---- Diagnostic checks before applying ----
+sum(current_names %in% names(date_to_gene))   # how many affected rows found
+table(current_names[current_names %in% names(date_to_gene)])  # which ones
+
+# Apply the repaired symbols.
+rownames(gene_matrix_final_84076) <- fixed_names
+
+# Interim copy (unfiltered); overwritten by the final save in section 9.
+saveRDS(gene_matrix_final_84076, "gene_matrix_final_84076.rds")
+
+
+```
+
+## 5. Check the value distribution and build the clinical table
+
+Disease and vaccination groups are read from the sample descriptions.
+
+```{r}
+## ---- 5. Inspect expression value distribution ----
+
+summary(as.vector(gene_matrix_final_84076))
+
+quantile(
+  as.vector(gene_matrix_final_84076),
+  probs = c(0, 0.25, 0.5, 0.75, 0.90, 0.95, 0.99, 1)
+)
+
+range(gene_matrix_final_84076)
+
+sum(gene_matrix_final_84076 == 0)
+mean(gene_matrix_final_84076 == 0) * 100
+
+## ---- 5.1 Construct clinical metadata ----
+
+# Construct a simplified clinical metadata table from the GEO
+# phenotype data. Disease group labels are derived from the sample
+# titles supplied by the study.
+
+clin_84076 <- data.frame(
+  sample_id = rownames(pheno_84076),
+  clinical = pheno_84076$`clinical information:ch1`,
+  stringsAsFactors = FALSE
+)
+
+# Derive disease status.
+
+clin_84076$disease_status <- dplyr::case_when(
+  grepl("^Control", clin_84076$clinical) ~ "Control",
+  grepl("^Latent Tuberculosis", clin_84076$clinical) ~ "LTBI",
+  grepl("^Treated Active Tuberculosis", clin_84076$clinical) ~ "Treated ATB",
+  grepl("^Active Tuberculosis", clin_84076$clinical) ~ "ATB",
+  TRUE ~ NA_character_
+)
+
+# Derive vaccination status.
+
+clin_84076$vaccination_status <- dplyr::case_when(
+  grepl("Unvaccinated$", clin_84076$clinical, ignore.case = TRUE) ~ "Unvaccinated",
+  grepl("vaccinated$", clin_84076$clinical, ignore.case = TRUE) ~ "Vaccinated",
+  TRUE ~ NA_character_
+)
+
+
+# Convert to factors.
+
+clin_84076$disease_status <- factor(
+  clin_84076$disease_status,
+  levels = c(
+    "Control",
+    "LTBI",
+    "ATB",
+    "Treated ATB"
+  )
+)
+
+clin_84076$vaccination_status <- factor(
+  clin_84076$vaccination_status,
+  levels = c(
+    "Vaccinated",
+    "Unvaccinated"
+  )
+)
+
+## ---- Diagnostic checks ----
+
+table(clin_84076$disease_status)
+
+table(
+  clin_84076$vaccination_status,
+  useNA = "ifany"
+)
+
+head(clin_84076)
+
+
+## ---- 5.2 Fix sample_id to match expr_84076's naming convention ----
+
+# pheno_84076$title holds the original cohort sample names
+# (e.g. "Treated_ATB_0", "LTBI_Unvac_2"), which is what expr_84076's
+# column headers use — NOT the GSM accession. Replace sample_id
+# accordingly so clin_84076 can be joined to expr_84076 correctly.
+
+# The expression columns are named by cohort sample name, not by GSM accession.
+clin_84076$sample_id <- pheno_84076$title
+
+## ---- 5.2.1 Diagnostic checks ----
+
+# Confirm every expr_84076 column now has a matching clin_84076 row
+sum(clin_84076$sample_id %in% colnames(expr_84076))   # should be 36
+setdiff(colnames(expr_84076), clin_84076$sample_id)    # should be character(0)
+setdiff(clin_84076$sample_id, colnames(expr_84076))    # should be character(0)
+```
+
+## 6a. Density plot before log2
+
+```{r}
+## ---- 6.1 Initial density plot ----
+
+# Examine the distribution of normalized FPKM values prior to log2
+# transformation. RNA-seq expression data are typically right-skewed,
+# and visual inspection helps determine whether a variance-stabilizing
+# transformation is required.
+
+plot(
+  density(as.vector(gene_matrix_final_84076)),
+  lwd = 2,
+  main = "Density of normalized FPKM values",
+  xlab = "Expression"
+)
+
+
+## ---- 6.2.1 Zoomed density plot ----
+
+expr_zoom <- as.vector(gene_matrix_final_84076)
+expr_zoom <- expr_zoom[expr_zoom <= 100]
+
+plot(
+  density(expr_zoom),
+  lwd = 2,
+  main = "Density of normalized FPKM values (0–100 FPKM)",
+  xlab = "FPKM expression"
+)
+```
+The density plot demonstrates that the processed RNA-seq FPKM values are highly right-skewed, with the majority of expression values concentrated close to zero and a long tail extending to very high expression values. This distribution is characteristic of normalized FPKM data but is not ideal for multivariate analyses such as PCA, where highly expressed genes can disproportionately influence the variance structure. These observations support the application of a log₂(FPKM + 1) transformation to stabilize the variance and compress the dynamic range of gene expression.
+
+
+## 6b. Median expression by group before log2
+
+```{r}
+## ---- 6.2 Initial QC: Median expression by disease group ----
+
+# Calculate the median normalized expression for each sample.
+
+sample_summary <- data.frame(
+  Sample = colnames(gene_matrix_final_84076),
+  Group = clin_84076$disease_status,
+  Median = apply(gene_matrix_final_84076, 2, median)
+)
+group_cols <- c(
+  "Control" = "#4DAF4A",
+  "LTBI" = "#377EB8",
+  "ATB" = "#E41A1C",
+  "Treated_ATB" = "#984EA3"
+)
+# Compare median normalized expression across disease groups.
+
+boxplot(
+  Median ~ Group,
+  data = sample_summary,
+  outline = FALSE,
+  col = group_cols,
+  main = "Median normalized expression by disease group",
+  xlab = "Disease group",
+  ylab = "Median FPKM"
+)
+
+# Overlay individual samples.
+
+stripchart(
+  Median ~ Group,
+  data = sample_summary,
+  vertical = TRUE,
+  method = "jitter",
+  jitter = 0.15,
+  pch = 19,
+  col = adjustcolor("black", alpha.f = 0.6),
+  add = TRUE
+)
+
+
+
+```
+The median expression values were generally comparable across all disease groups, with no substantial systematic shifts observed between samples. This suggests that the authors' normalization procedure effectively minimized global differences in expression intensity between samples. Consequently, there is no immediate evidence indicating the need for an additional between-sample normalization step. However, the strong skewness observed in the expression distributions suggests that a variance-stabilizing transformation is still appropriate.
+
+
+## 6c. Prepare the PCA input
+
+Remove zero-variance genes and keep the 1 000 most variable.
+
+```{r}
+## ---- 6.3 Prepare data for PCA ----
+
+# PCA requires genes with non-zero variance. Genes with zero
+# variance are removed, after which the 1,000 most variable
+# genes are selected to highlight the dominant sources of
+# biological variation between samples.
+
+# Remove genes with zero variance
+gene_sd <- apply(gene_matrix_final_84076, 1, sd)
+
+cat("Genes with zero variance:",
+    sum(gene_sd == 0), "\n")
+
+expr_pca_84076 <- gene_matrix_final_84076[
+  gene_sd > 0,
+]
+
+cat("Genes retained after removing zero-variance genes:",
+    nrow(expr_pca_84076), "\n")
+
+# Select the 1000 most variable genes
+gene_var <- apply(expr_pca_84076, 1, var)
+
+top1000 <- order(
+  gene_var,
+  decreasing = TRUE
+)[1:1000]
+
+expr_pca_84076 <- expr_pca_84076[
+  top1000,
+]
+
+cat("Genes used for PCA:",
+    nrow(expr_pca_84076), "\n")
+
+```
+
+
+
+## 6d. PCA of the 1 000 most variable genes
+
+```{r}
+## ---- 6.4 PCA using the 1000 most variable genes ----
+
+# PCA was performed using the 1,000 most variable genes to
+# emphasize the dominant sources of biological variation while
+# reducing the influence of genes showing little variation
+# across samples.
+
+# Transpose so samples are rows and genes are columns
+pca_input <- t(expr_pca_84076)
+
+# Run PCA
+pca_84076 <- prcomp(
+  pca_input,
+  scale. = TRUE
+)
+
+# Percentage variance explained
+var_explained <- round(
+  100 * (pca_84076$sdev^2 / sum(pca_84076$sdev^2)),
+  1
+)
+
+# Confirm sample order matches the clinical metadata
+identical(
+  rownames(pca_input),
+  clin_84076$sample_id
+)
+
+# Create plotting data frame
+pca_df <- data.frame(
+  PC1 = pca_84076$x[,1],
+  PC2 = pca_84076$x[,2],
+  Group = clin_84076$disease_status
+)
+
+# PCA plot
+ggplot(
+  pca_df,
+  aes(PC1, PC2, colour = Group)
+) +
+  geom_point(
+    size = 2.5,
+    alpha = 0.8
+  ) +
+  labs(
+    title = "PCA of the 1000 Most Variable Genes",
+    x = paste0("PC1 (", var_explained[1], "%)"),
+    y = paste0("PC2 (", var_explained[2], "%)")
+  ) +
+  theme_minimal()
+```
+PCA performed on the normalized FPKM values revealed moderate separation between samples but no obvious clustering driven solely by disease status. Most samples formed a central cluster, while a small number of observations appeared more distant from the main distribution. Given the highly skewed nature of the FPKM values, these principal components are likely influenced by a relatively small number of highly expressed genes. A log₂(FPKM + 1) transformation was therefore applied prior to further exploratory analyses to reduce the influence of extreme expression values and improve representation of the overall biological variation.
+
+## 6e. PCA by vaccination status
+
+```{r}
+## ---- Initial PCA by vaccination status ----
+
+pca_vacc <- data.frame(
+  PC1 = pca_84076$x[, 1],
+  PC2 = pca_84076$x[, 2],
+  Vaccination = clin_84076$vaccination_status
+)
+
+ggplot(
+  pca_vacc,
+  aes(
+    x = PC1,
+    y = PC2,
+    colour = Vaccination
+  )
+) +
+  geom_point(size = 3) +
+  labs(
+    title = "PCA of the Top 1000 Most Variable Genes by Vaccination Status",
+    x = paste0(
+      "PC1 (",
+      var_explained[1],
+      "%)"
+    ),
+    y = paste0(
+      "PC2 (",
+      var_explained[2],
+      "%)"
+    ),
+    colour = "Vaccination"
+  ) +
+  theme_minimal()
+```
+
+Initial quality assessment indicated that the processed RNA-seq expression matrix had already undergone between-sample normalization, as evidenced by the comparable median expression values across disease groups. However, the expression distributions remained highly right-skewed, with a substantial proportion of genes exhibiting low expression and a small number of genes displaying extremely high FPKM values. To stabilize the variance and improve the suitability of the data for downstream multivariate analyses, a log₂(FPKM + 1) transformation was applied before repeating quality assessment.
+
+
+## 7. Expression filter
+
+Keep genes with FPKM of at least 1 in a minimum number of samples.
+
+```{r}
+## ---- 7. Expression filtering ----
+
+# Although GSE84076 contains processed FPKM values rather than raw
+# counts, genes with consistently negligible expression contribute
+# little biological information and may introduce unnecessary noise.
+# Genes with an FPKM ≥ 1 in at least 8 samples (the smallest disease
+# group) were therefore retained for downstream analyses.
+
+# NOTE: the threshold of 8 samples is a fixed number; the comment above calls it the
+# size of the smallest disease group, but the active TB group has 6 samples (check wording).
+keep_84076 <- rowSums(gene_matrix_final_84076 >= 1) >= 8
+
+gene_matrix_final_84076 <- gene_matrix_final_84076[
+  keep_84076,
+]
+
+## ---- 7.1 Diagnostic checks ----
+
+cat(
+  "Genes before filtering:",
+  length(keep_84076),
+  "\n"
+)
+
+cat(
+  "Genes retained:",
+  nrow(gene_matrix_final_84076),
+  "\n"
+)
+
+cat(
+  "Genes removed:",
+  length(keep_84076) -
+    nrow(gene_matrix_final_84076),
+  "\n"
+)
+
+cat(
+  "Percentage retained:",
+  round(
+    100 *
+      nrow(gene_matrix_final_84076) /
+      length(keep_84076),
+    1
+  ),
+  "%\n"
+)
+
+```
+
+
+## 7a. Log2 transformation
+
+log2(FPKM + 1).
+
+```{r}
+## ---- 7.2 Log2 transformation ----
+
+# Following expression filtering, the processed RNA-seq matrix
+# contained normalized FPKM values generated by the original study
+# authors. Because FPKM values typically exhibit a strongly
+# right-skewed distribution, a log2(FPKM + 1) transformation was
+# applied to stabilize the variance, reduce the influence of highly
+# expressed genes, and improve the suitability of the data for
+# exploratory analyses and downstream multivariate modelling.
+
+# Used for QC plots only; the saved matrix stays on the FPKM scale.
+log2_expr_84076 <- log2(gene_matrix_final_84076 + 1)
+
+## Diagnostic checks
+
+range(log2_expr_84076)
+
+sum(is.infinite(log2_expr_84076))
+
+summary(as.vector(log2_expr_84076))
+```
+
+The processed RNA-seq matrix contained normalized FPKM values with a highly right-skewed distribution. Following log₂(FPKM + 1) transformation, the range of expression values was substantially compressed (0 to 15.81), reducing the influence of highly expressed genes while preserving the relative ordering of expression levels. This variance-stabilizing transformation improves the suitability of the dataset for downstream multivariate analyses such as principal component analysis and MINT.
+
+
+## 8a. Density plot after log2
+
+```{r}
+## ---- 8.1 Density plot after log2 transformation ----
+
+plot(
+  density(as.vector(log2_expr_84076)),
+  lwd = 2,
+  main = "Density plot after log2 transformation",
+  xlab = "Log2(FPKM + 1)"
+)
+```
+Following log₂(FPKM + 1) transformation, the overall distribution of expression values became substantially less right-skewed, with the dynamic range compressed relative to the original FPKM values. A pronounced peak remained at zero, reflecting the large proportion of genes with absent or very low expression across samples rather than a technical artifact. The transformation therefore stabilized the variance while preserving the underlying biological structure of the dataset.
+
+
+## 8b. Median expression after log2
+
+```{r}
+## ---- 8.2 Median log2 expression by disease group ----
+
+# Calculate the median log2-transformed expression for each sample.
+
+sample_summary <- data.frame(
+  Sample = colnames(log2_expr_84076),
+  Group = clin_84076$disease_status,
+  Median = apply(log2_expr_84076, 2, median)
+)
+
+# Define colours for each disease group.
+
+group_cols <- c(
+  "Control" = "#4DAF4A",
+  "LTBI" = "#377EB8",
+  "ATB" = "#E41A1C",
+  "Treated ATB" = "#984EA3"
+)
+
+# Compare median log2 expression across disease groups.
+
+boxplot(
+  Median ~ Group,
+  data = sample_summary,
+  outline = FALSE,
+  col = group_cols,
+  main = "Median log2 expression by disease group",
+  xlab = "Disease group",
+  ylab = "Median log2(FPKM + 1)"
+)
+
+# Overlay individual samples.
+
+stripchart(
+  Median ~ Group,
+  data = sample_summary,
+  vertical = TRUE,
+  method = "jitter",
+  jitter = 0.15,
+  pch = 19,
+  col = adjustcolor("black", alpha.f = 0.6),
+  add = TRUE
+)
+```
+The distribution of median log₂-transformed expression values remained comparable across all disease groups, with no evidence of systematic shifts between samples. This indicates that the original study normalization had already minimized between-sample technical variation and that the log₂ transformation primarily served to stabilize the variance rather than alter global expression distributions. Consequently, no additional between-sample normalization was considered necessary.
+
+
+## 8c. PCA after log2
+
+```{r}
+## ---- 8.3 PCA on log2-transformed data ----
+
+# Remove genes with zero variance.
+
+gene_sd <- apply(log2_expr_84076, 1, sd)
+
+expr_pca_84076 <- log2_expr_84076[
+  gene_sd > 0,
+]
+
+# Select the 1000 most variable genes.
+
+gene_var <- apply(
+  expr_pca_84076,
+  1,
+  var
+)
+
+top1000 <- order(
+  gene_var,
+  decreasing = TRUE
+)[1:1000]
+
+expr_pca_84076 <- expr_pca_84076[
+  top1000,
+]
+
+# Transpose so samples are rows.
+
+pca_input <- t(expr_pca_84076)
+
+# Perform PCA.
+
+pca_84076 <- prcomp(
+  pca_input,
+  scale. = TRUE
+)
+
+# Percentage variance explained.
+
+var_explained <- round(
+  100 * (pca_84076$sdev^2 / sum(pca_84076$sdev^2)),
+  1
+)
+
+# Confirm sample order.
+
+identical(
+  rownames(pca_input),
+  clin_84076$sample_id
+)
+
+# Create plotting data frame.
+
+pca_df <- data.frame(
+  PC1 = pca_84076$x[, 1],
+  PC2 = pca_84076$x[, 2],
+  Group = clin_84076$disease_status
+)
+
+# PCA plot.
+
+ggplot(
+  pca_df,
+  aes(
+    PC1,
+    PC2,
+    colour = Group
+  )
+) +
+  geom_point(
+    size = 2.5,
+    alpha = 0.8
+  ) +
+  labs(
+    title = "PCA of the Top 1000 Most Variable Genes",
+    x = paste0(
+      "PC1 (",
+      var_explained[1],
+      "%)"
+    ),
+    y = paste0(
+      "PC2 (",
+      var_explained[2],
+      "%)"
+    ),
+    colour = "Disease group"
+  ) +
+  theme_minimal()
+```
+Principal component analysis was performed using the 1,000 most variable genes following log₂ transformation. The first two principal components explained 20.1% and 12.0% of the total variance, respectively. Partial separation of Active TB samples from the remaining disease groups was observed along PC1, although considerable overlap remained, reflecting the inherent biological heterogeneity of the cohort. No obvious outlying samples were identified.
+
+Collectively, the quality control assessments indicated that the processed RNA-seq expression matrix was suitable for downstream analysis following log₂(FPKM + 1) transformation. While the transformation substantially reduced the skewness of the expression distributions, comparable median expression values across samples and the absence of systematic technical clustering in the PCA suggested that additional between-sample normalization was unnecessary. The remaining high proportion of zero or low-expression genes reflects the inherent sparsity of RNA-seq data and was addressed in the subsequent feature-filtering stage prior to integrative analysis with MINT.
+
+
+
+## 9. Save
+
+Final filtered matrix and clinical table.
+
+```{r}
+## ---- 9.2 Save processed dataset ----
+
+saveRDS(
+  gene_matrix_final_84076,
+  "gene_matrix_final_84076.rds"
+)
+
+saveRDS(
+  clin_84076,
+  "clin_84076.rds"
+)
+```
+
+
+
+
