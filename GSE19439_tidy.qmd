@@ -1,0 +1,1001 @@
+---
+title: "GSE19439-Microarry"
+html:
+    self-contained: true
+    execute:
+      warning: false
+      message: false
+---
+
+
+# GSE19439: UK whole-blood microarray cohort (cleaning and QC)
+
+**What this file does.** It downloads the UK Illumina HumanHT-12 v3 microarray dataset (GSE19439; 42 samples: Control, LTBI and active TB), removes poorly detected probes, log2-transforms the data, checks quality (density, median, relative log expression and PCA plots), maps probes to gene symbols, keeps one probe per gene and saves a gene-by-sample matrix and a clinical table.
+
+**Role in the project:** training cohort (UK microarray) in the MINT integration.
+
+**Inputs:** GEO series matrix (downloaded by `getGEO`) and the raw supplementary archive `GSE19439_RAW.tar`, which holds the Illumina detection p-values (download it from GEO and set the paths in section 4).
+
+**Outputs:** `detP_19439.rds`, `gene_matrix_final_19439.rds` (genes x samples) and `clin_19439.rds`. These are read by `MINT_Integration_Pipeline`.
+
+**Notes.**
+
+- The paths in section 4 point to the author's computer and must be changed to run the file.
+- The last chunk (pooled PCA across datasets) is exploratory. It needs the objects made by the other three cleaning files and will not run on its own.
+- The text between chunks is a set of working notes. Where its wording differs from the report, the report is the reference.
+
+
+
+## 1. Setup
+
+Load the packages used below.
+
+```{r}
+## ---- 1. Setup ----
+
+# Load packages required for downloading GEO data,
+# preprocessing Illumina microarray expression data,
+# data manipulation, and downstream analyses.
+
+library(GEOquery)
+library(SummarizedExperiment)
+library(tidyverse)
+library(janitor)
+library(sva)
+library(limma)
+
+
+```
+
+
+## 2. Download the GEO dataset
+
+Series matrix with the Illumina HumanHT-12 v3 platform (GPL6947).
+
+```{r}
+## ---- 2. Load GEO dataset ----
+
+# Download the GEO Series Matrix.
+# If multiple platforms are present, retain only GPL6947.
+
+gset_19439 <- getGEO("GSE19439",
+                     GSEMatrix = TRUE,
+                     getGPL = FALSE)
+
+if (length(gset_19439) > 1) {
+  idx <- grep("GPL6947", attr(gset_19439, "names"))
+} else {
+  idx <- 1
+}
+
+gset_19439 <- gset_19439[[idx]]
+
+# Extract the probe-level expression matrix
+expr_19439 <- exprs(gset_19439)
+```
+
+
+## 3. Check the raw expression values
+
+Range, missing values and dimensions decide whether a log2 transformation is needed.
+
+```{r}
+## ---- 3. Initial diagnostic checks ----
+
+# Inspect the range of raw probe intensities to determine whether
+# log2 transformation is required.
+range(expr_19439, na.rm = TRUE)
+
+# Check for missing expression values across the entire dataset.
+sum(is.na(expr_19439))
+
+# Confirm the dimensions of the expression matrix
+# (probes × samples).
+dim(expr_19439)
+```
+
+
+Initial diagnostic checks confirmed that the dataset contained 48,791 probes measured across 42 samples, with no missing expression values. The wide range of raw probe intensities (approximately -28 to 62,858) is characteristic of background-corrected Illumina microarray data and indicates that variance-stabilizing log2 transformation will be required before downstream analyses.
+
+
+## 4. Import detection p-values
+
+Read the detection p-value of every probe in every sample from the raw supplementary files; they are used in the filter in section 6.
+
+```{r}
+## ---- 4. Import Illumina detection p-values ----
+
+raw_dir <- "C:/Users/27826/Documents/HonoursProject/GSE19439_files/raw"
+
+# Extract the tar into raw_dir (adjust tar_path to wherever you saved it)
+tar_path <- "C:/Users/27826/Documents/HonoursProject/GSE19439_files/GSE19439_RAW.tar"
+untar(tar_path, exdir = raw_dir)
+
+# Confirm extraction worked
+sample_files <- list.files(
+  raw_dir,
+  pattern = "^GSM.*\\.txt\\.gz$",
+  full.names = TRUE
+)
+
+length(sample_files)  # should now be 42
+
+# Check row counts across all 42 files to catch any padding issue
+# in advance, before it crashes a stopifnot() mid-loop
+file_lengths <- sapply(sample_files, function(f) nrow(read.delim(gzfile(f))))
+table(file_lengths)
+which(file_lengths != 48791)  # expected probe count for this platform
+
+
+# Read the first sample to obtain the reference probe IDs.
+# Applying the same defensive empty-string/NA filter used for
+# GSE19444, even though no padding issue was found in this dataset,
+# to guard against any file-specific quirks.
+first_sample <- read.delim(gzfile(sample_files[1]))
+first_sample <- first_sample[!is.na(first_sample$ID_REF) & first_sample$ID_REF != "", ]
+
+probe_ids <- first_sample$ID_REF
+
+# Create an empty matrix for Detection.PVal values
+detP_19439 <- matrix(
+  nrow = length(probe_ids),
+  ncol = length(sample_files)
+)
+
+rownames(detP_19439) <- probe_ids
+
+# Sample names become the GSM accession numbers
+colnames(detP_19439) <- sub(
+  "_.*",
+  "",
+  basename(sample_files)
+)
+
+# Loop through every supplementary file and extract Detection.PVal.
+for (i in seq_along(sample_files)) {
+
+  dat <- read.delim(gzfile(sample_files[i]))
+
+  # Remove padding rows: blank ID_REF (empty string) or true NA
+  dat <- dat[!is.na(dat$ID_REF) & dat$ID_REF != "", ]
+
+  # Ensure probe ordering is identical to probe_ids
+  stopifnot(all(dat$ID_REF == probe_ids))
+
+  detP_19439[, i] <- dat$Detection.PVal
+}
+
+## ---- 4.1 Validate detection matrix ----
+dim(detP_19439)
+sum(is.na(detP_19439))
+range(detP_19439)
+common_probes <- intersect(rownames(expr_19439), rownames(detP_19439))
+length(common_probes)  # should be 48791, matching expr_19439 exactly
+expr_19439 <- expr_19439[common_probes, ]
+detP_19439 <- detP_19439[common_probes, ]
+identical(rownames(expr_19439), rownames(detP_19439))
+identical(colnames(expr_19439), colnames(detP_19439))
+# Saved so the detection filter can be reproduced without the raw files.
+saveRDS(detP_19439, "detP_19439.rds")
+```
+
+
+## 5. Clinical metadata
+
+Clean, select and rename the clinical variables so they match the other cohorts.
+
+```{r}
+## ---- 5. Load and clean clinical metadata ----
+
+# Extract the sample phenotype (clinical metadata).
+pheno_19439 <- pData(gset_19439)
+
+# Standardise GEO column names to lower case with underscores.
+clin_19439 <- janitor::clean_names(pheno_19439)
+
+# Retain only the clinical variables relevant for quality control,
+# exploratory analyses, and downstream modelling.
+clin_19439 <- dplyr::select(
+  clin_19439,
+  geo_accession,
+  illness_ch1,
+  gender_ch1,
+  age_ch1,
+  ethnicity_ch1,
+  geographical_region_ch1,
+  region_of_birth_ch1,
+  bcg_vaccinated_ch1,
+  exposure_latent_ch1,
+  tst_ch1,
+  sputum_smear_ch1,
+  sputum_culture_ch1,
+  bal_smear_ch1,
+  bal_culture_ch1,
+  smear_of_index_case_ch1,
+  index_case_disease_site_ch1,
+  isolate_sensitivity_ch1,
+  modal_x_ray_grade_ch1
+)
+
+# Rename variables using a consistent naming convention to simplify
+# downstream integration across datasets.
+clin_19439 <- clin_19439 %>%
+  rename(
+    sample_id         = geo_accession,
+    group_status      = illness_ch1,
+    gender            = gender_ch1,
+    age               = age_ch1,
+    ethnicity         = ethnicity_ch1,
+    geographic_region = geographical_region_ch1,
+    birth_region      = region_of_birth_ch1,
+    bcg_status        = bcg_vaccinated_ch1,
+    latent_exposure   = exposure_latent_ch1,
+    tst_result        = tst_ch1,
+    sputum_smear      = sputum_smear_ch1,
+    sputum_culture    = sputum_culture_ch1,
+    bal_smear         = bal_smear_ch1,
+    bal_culture       = bal_culture_ch1,
+    index_case_smear  = smear_of_index_case_ch1,
+    index_case_site   = index_case_disease_site_ch1,
+    drug_sensitivity  = isolate_sensitivity_ch1,
+    xray_grade        = modal_x_ray_grade_ch1
+  )
+
+# Convert age to numeric for downstream analyses.
+clin_19439$age <- as.numeric(clin_19439$age)
+
+# Harmonise disease group labels across all tuberculosis datasets.
+clin_19439$group_status <- recode(
+  clin_19439$group_status,
+  "Control (BCG+)" = "Control",
+  "Control (BCG-)" = "Control",
+  "Latent" = "LTBI",
+  "PTB" = "PTB"
+)
+
+# Store disease group as an ordered factor for plotting and modelling.
+clin_19439$group_status <- factor(
+  clin_19439$group_status,
+  levels = c("Control", "LTBI", "PTB")
+)
+
+group_cols <- c(
+  Control = "#1B9E77",
+  LTBI    = "#D95F02",
+  PTB     = "#7570B3"
+)
+
+# Confirm that the phenotype data remain aligned with the expression matrix.
+all(clin_19439$sample_id == colnames(expr_19439))
+
+# Inspect the cleaned clinical metadata.
+str(clin_19439)
+# Confirm sample numbers in each disease group.
+table(clin_19439$group_status)
+
+```
+
+
+## 5a. Raw QC: median expression by group
+
+```{r}
+## ---- 5.1 Raw QC: Median expression by disease group ----
+
+
+# Calculate the median raw expression for each sample.
+sample_summary <- data.frame(
+  Sample = colnames(expr_19439),
+  Group  = clin_19439$group_status,
+  Median = apply(expr_19439, 2, median)
+)
+
+# Compare median raw expression across disease groups.
+boxplot(
+  Median ~ Group,
+  data = sample_summary,
+  outline = FALSE,
+  col = group_cols,
+  main = "Median raw expression by disease group",
+  xlab = "Disease group",
+  ylab = "Median raw expression"
+)
+
+# Overlay individual samples using jittered points.
+stripchart(
+  Median ~ Group,
+  data = sample_summary,
+  vertical = TRUE,
+  method = "jitter",
+  jitter = 0.15,
+  pch = 19,
+  col = adjustcolor("black", alpha.f = 0.6),
+  add = TRUE
+)
+```
+Median raw expression per sample, grouped by disease status (Figure X), showed a decreasing trend from Control to LTBI to PTB, with PTB samples displaying the lowest median intensities and greatest spread. As with the raw microarray intensities generally, these differences are expected prior to normalization and were assessed further following log2 transformation.
+
+
+## 5b. Raw PCA by disease group
+
+Colours are fixed here and reused in the plots that follow.
+
+```{r}
+# Colours for each disease group
+group_cols <- c(
+  "Control" = "#F8766D",
+  "LTBI"    = "#00BA38",
+  "ATB"     = "#619CFF"
+)
+## ---- 5.2 Raw PCA ----
+
+# Perform principal component analysis (PCA) on the raw
+# expression matrix to assess overall sample relationships
+# prior to normalisation.
+
+pca_raw <- prcomp(
+  t(expr_19439),
+  scale. = TRUE
+)
+
+group_factor <- clin_19439$group_status
+
+plot(
+  pca_raw$x[, 1],
+  pca_raw$x[, 2],
+  col = group_cols[group_factor],
+  pch = 19,
+  cex = 1.3,
+  xlab = paste0("PC1 (", round(summary(pca_raw)$importance[2, 1] * 100, 1), "%)"),
+  ylab = paste0("PC2 (", round(summary(pca_raw)$importance[2, 2] * 100, 1), "%)"),
+  main = " PCA by disease group"
+)
+
+legend(
+  x = "topright",
+  inset = c(0.03, 0.03),
+  legend = levels(group_factor),
+  col = group_cols,
+  pch = 19,
+  bty = "n"
+)
+```
+Principal component analysis (PCA) was performed on the 1000 most variable probes from the raw expression matrix to assess the overall structure of the dataset prior to preprocessing (Figure X). The first two principal components explained 32.5% and 13.1% of the total variance, respectively. Samples showed partial clustering according to disease status, with PTB samples tending to separate along PC1, whereas Control and LTBI samples exhibited substantial overlap. Despite this emerging biological structure, considerable within-group variability remained, reflecting the influence of technical variation and the unnormalized nature of the raw expression data. This analysis serves as a baseline for comparison with the PCA generated following log₂ transformation, quantile normalization, and probe-to-gene summarization, where improved clustering and reduced technical variability are expected.
+
+## 5c. Raw PCA by gender
+
+```{r}
+
+## ---- 5.3 PCA by gender ----
+
+plot(
+  pca_raw$x[, 1],
+  pca_raw$x[, 2],
+  col = as.factor(clin_19439$gender),
+  pch = 19,
+  cex = 1.3,
+  xlab = paste0("PC1 (", round(summary(pca_raw)$importance[2, 1] * 100, 1), "%)"),
+  ylab = paste0("PC2 (", round(summary(pca_raw)$importance[2, 2] * 100, 1), "%)"),
+  main = "Raw PCA coloured by gender"
+)
+
+legend(
+  "topright",
+  inset = c(0.03, 0.03),
+  legend = levels(as.factor(clin_19439$gender)),
+  col = 1:length(levels(as.factor(clin_19439$gender))),
+  pch = 19,
+  bty = "n"
+)
+```
+PCA coloured by sex showed no distinct clustering of male and female samples. Individuals of both sexes were distributed throughout the PCA space, with substantial overlap across the principal components. This suggests that sex is not a major contributor to the variation observed among the top 1000 most variable probes and is therefore unlikely to represent a significant source of technical or biological confounding within this dataset.
+
+
+## 5d. Raw PCA by ethnicity
+
+```{r}
+
+## ---- 5.4 PCA by ethnicity ----
+
+plot(
+  pca_raw$x[, 1],
+  pca_raw$x[, 2],
+  col = as.factor(clin_19439$ethnicity),
+  pch = 19,
+  cex = 1.3,
+  xlab = paste0("PC1 (", round(summary(pca_raw)$importance[2, 1] * 100, 1), "%)"),
+  ylab = paste0("PC2 (", round(summary(pca_raw)$importance[2, 2] * 100, 1), "%)"),
+  main = "Raw PCA coloured by ethnicity"
+)
+
+legend(
+  "topright",
+  inset = c(0.03, 0.03),
+  legend = levels(as.factor(clin_19439$ethnicity)),
+  col = 1:length(levels(as.factor(clin_19439$ethnicity))),
+  pch = 19,
+  bty = "n",
+  cex = 0.8
+)
+```
+PCA coloured by ethnicity revealed substantial overlap between ethnic groups, with no distinct clustering along the first two principal components. White participants showed a slight tendency to cluster toward the upper-left region of the PCA, while the remaining ethnic groups were distributed broadly across the ordination space. Several samples with high PC1 values were observed across multiple ethnicities, indicating that ethnicity alone does not explain the principal sources of variation within the dataset.
+
+
+## 5e. Raw PCA by birth region
+
+```{r}
+
+## ---- 5.5 PCA by birth region ----
+
+plot(
+  pca_raw$x[, 1],
+  pca_raw$x[, 2],
+  col = as.factor(clin_19439$birth_region),
+  pch = 19,
+  cex = 1.3,
+  xlab = paste0("PC1 (", round(summary(pca_raw)$importance[2, 1] * 100, 1), "%)"),
+  ylab = paste0("PC2 (", round(summary(pca_raw)$importance[2, 2] * 100, 1), "%)"),
+  main = "Raw PCA coloured by birth region"
+)
+
+legend(
+  "topright",
+  inset = c(0.03, 0.03),
+  legend = levels(as.factor(clin_19439$birth_region)),
+  col = 1:length(levels(as.factor(clin_19439$birth_region))),
+  pch = 19,
+  bty = "n"
+)
+```
+PCA coloured by birth region showed considerable overlap between UK-born and non-UK-born participants, with no distinct clustering observed along either principal component. Although non-UK-born individuals occupied a broader area of the PCA space, this likely reflects their greater representation within the cohort rather than a biological separation. These findings suggest that birth region is not a major contributor to the primary sources of transcriptomic variation in this dataset.
+
+## 5f. Raw PCA by BCG vaccination status
+
+```{r}
+
+## ---- 5.6 PCA by BCG vaccination status ----
+
+plot(
+  pca_raw$x[, 1],
+  pca_raw$x[, 2],
+  col = as.factor(clin_19439$bcg_status),
+  pch = 19,
+  cex = 1.3,
+  xlab = paste0("PC1 (", round(summary(pca_raw)$importance[2, 1] * 100, 1), "%)"),
+  ylab = paste0("PC2 (", round(summary(pca_raw)$importance[2, 2] * 100, 1), "%)"),
+  main = "Raw PCA coloured by BCG vaccination status"
+)
+
+legend(
+  "topright",
+  inset = c(0.03, 0.03),
+  legend = levels(as.factor(clin_19439$bcg_status)),
+  col = 1:length(levels(as.factor(clin_19439$bcg_status))),
+  pch = 19,
+  bty = "n",
+  cex = 0.8
+)
+```
+PCA coloured by BCG vaccination status showed substantial overlap between vaccinated and unvaccinated participants, with no distinct clustering observed along either principal component. Participants from both groups were distributed throughout the PCA space, including the more dispersed samples with higher PC1 values. The two participants with unknown vaccination status did not occupy unique positions. These findings suggest that BCG vaccination status is not a major contributor to the global transcriptomic variation captured by the first two principal components.
+
+## 5g. Raw PCA by latent exposure
+
+```{r}
+
+## ---- 5.7 PCA by latent exposure ----
+
+plot(
+  pca_raw$x[, 1],
+  pca_raw$x[, 2],
+  col = as.factor(clin_19439$latent_exposure),
+  pch = 19,
+  cex = 1.3,
+  xlab = paste0("PC1 (", round(summary(pca_raw)$importance[2, 1] * 100, 1), "%)"),
+  ylab = paste0("PC2 (", round(summary(pca_raw)$importance[2, 2] * 100, 1), "%)"),
+  main = "Raw PCA coloured by latent exposure"
+)
+
+legend(
+  "topright",
+  inset = c(0.03, 0.03),
+  legend = levels(as.factor(clin_19439$latent_exposure)),
+  col = 1:length(levels(as.factor(clin_19439$latent_exposure))),
+  pch = 19,
+  bty = "n",
+  cex = 0.8
+)
+```
+PCA coloured by latent exposure history showed substantial overlap among all exposure categories, with no distinct clustering observed along the first two principal components. Samples from the Contact Screen and unknown exposure groups were broadly distributed throughout the PCA space, while the few New Entrant and GP Referral samples did not occupy unique positions. Given the small number of individuals within some exposure categories, these findings should be interpreted cautiously. Overall, latent exposure history does not appear to be a major contributor to the global variation captured by the top 1000 most variable probes.
+
+
+
+To investigate potential sources of variation, PCA was coloured according to several available clinical variables, including disease status, sex, ethnicity, birth region, BCG vaccination status, and latent exposure history. Of these variables, disease status demonstrated the clearest, albeit partial, separation, with PTB samples tending to separate along PC1. In contrast, the remaining clinical variables showed substantial overlap between groups and did not explain the primary axes of variation. These findings suggest that the dominant biological signal within the dataset is associated with tuberculosis disease status rather than demographic or clinical covariates.
+
+## 5h. Raw density plot
+
+```{r}
+
+## ---- 5.8 Raw density plot ----
+
+plotDensities(
+  expr_19439,
+  legend = FALSE,
+  main = "Density plot of raw expression intensities",
+  xlab = "Expression intensity"
+)
+```
+
+## 6. Detection p-value filter
+
+Keep probes detected (p < 0.01) in at least half the samples of any group.
+
+```{r}
+
+# ---- 6. Detection p-value filtering ----
+
+# Biological groups
+group <- clin_19439$group_status
+
+# Empty logical vector (one value per probe)
+# One TRUE/FALSE per probe; a probe is kept if it passes in at least one group.
+keep <- logical(nrow(detP_19439))
+
+# Keep probes detected (Detection.PVal < 0.01)
+# in at least 50% of samples within any biological group.
+
+for (g in unique(group)) {
+
+  idx <- group == g
+
+  detected <- rowSums(detP_19439[, idx] < 0.01)
+
+  threshold <- ceiling(0.50 * sum(idx))
+
+  keep <- keep | (detected >= threshold)
+}
+
+# Filter expression matrix
+expr_19439_filt <- expr_19439[keep, ]
+
+# Filter detection matrix
+detP_19439_filt <- detP_19439[keep, ]
+
+## ---- 6.1 Detection filter summary ----
+
+cat("Probes before filtering :", nrow(expr_19439), "\n")
+
+cat("Probes retained         :", nrow(expr_19439_filt), "\n")
+
+cat("Probes removed          :",
+    nrow(expr_19439) - nrow(expr_19439_filt),
+    "\n")
+
+cat("Percentage retained     :",
+    round(100 * nrow(expr_19439_filt) / nrow(expr_19439), 2),
+    "%\n")
+```
+Detection p-value filtering retained 13,091 of 48,791 probes (26.83%). This retention rate was highly consistent with that observed for GSE19444 (26.74%), supporting the use of a standardized preprocessing workflow across both Illumina HumanHT-12 datasets.
+
+
+## 7. Log2 transformation
+
+A small offset makes all values positive before the log.
+
+```{r}
+## ---- 7. Log2 transformation (offset-shifted) ----
+
+# Following detection p-value filtering, only 0.17% of remaining
+# values are negative (range: -27.21 to 62858.36), indicating that
+# detection filtering removed almost all probes affected by
+# BeadStudio background-subtraction artifacts. A small global
+# offset is applied prior to log2 transformation to ensure all
+# expression values are positive while minimally altering the
+# distribution of the data.
+
+global_min <- min(expr_19439_filt, na.rm = TRUE)
+
+# Offset makes the minimum value 1, so log2 is defined for every entry.
+offset <- abs(global_min) + 1
+
+log2_expr_19439_filt <- log2(expr_19439_filt + offset)
+
+range(log2_expr_19439_filt)
+
+sum(is.infinite(log2_expr_19439_filt))
+
+summary(as.vector(log2_expr_19439_filt))
+
+```
+
+## 7a. Density plot after log2
+
+```{r}
+## ---- 7.2 Density plot after log2 transformation ----
+
+# Inspect the distribution of expression values following
+# log2 transformation. Similar density distributions across
+# arrays provide evidence that the original BeadStudio average
+# chip normalization remains appropriate and that additional
+# between-array normalization is unnecessary.
+
+limma::plotDensities(
+  log2_expr_19439_filt,
+  legend = FALSE,
+  main = "Density plot after log2 transformation",
+  xlab = "Log2 expression"
+)
+
+```
+
+## 7b. Median expression after log2
+
+```{r}
+## ---- 7.3 QC: Median expression after log2 transformation ----
+
+# Calculate the median log2-transformed expression for each sample.
+sample_summary <- data.frame(
+  Sample = colnames(log2_expr_19439_filt),
+  Group  = clin_19439$group_status,
+  Median = apply(log2_expr_19439_filt, 2, median)
+)
+
+# Compare median log2-transformed expression across disease groups.
+boxplot(
+  Median ~ Group,
+  data = sample_summary,
+  outline = FALSE,
+  col = group_cols,
+  main = "Median log2 expression by disease group",
+  xlab = "Disease group",
+  ylab = "Median log2 expression"
+)
+
+# Overlay individual samples using jittered points.
+stripchart(
+  Median ~ Group,
+  data = sample_summary,
+  vertical = TRUE,
+  method = "jitter",
+  jitter = 0.15,
+  pch = 19,
+  col = adjustcolor("black", alpha.f = 0.6),
+  add = TRUE
+)
+```
+
+## 7c. Relative log expression (RLE)
+
+```{r}
+## ---- 7.5 Relative Log Expression (RLE) plot ----
+
+# Relative Log Expression (RLE) was used to assess sample-to-sample
+# consistency following detection filtering and log2 transformation.
+# For each probe, the median expression across all samples was
+# subtracted from each individual sample. Samples with median RLE
+# values centred near zero and similar interquartile ranges indicate
+# minimal systematic technical variation, providing additional
+# evidence that further between-array normalization is unnecessary.
+
+rle_data <- log2_expr_19439_filt -
+  matrixStats::rowMedians(log2_expr_19439_filt)
+
+# Order samples by disease group for easier visual interpretation
+sample_order <- order(clin_19439$group_status)
+
+boxplot(
+  rle_data[, sample_order],
+  outline = FALSE,
+  las = 2,
+  cex.axis = 0.6,
+  col = group_cols[clin_19439$group_status[sample_order]],
+  main = "RLE plot after log2 transformation",
+  ylab = "Relative log expression"
+)
+
+abline(h = 0, col = "red", lty = 2)
+
+legend(
+  "topright",
+  legend = levels(clin_19439$group_status),
+  fill = group_cols,
+  cex = 0.8,
+  bty = "n"
+)
+```
+
+
+
+
+
+
+
+## 7d. PCA after filtering and log2
+
+```{r}
+
+## ---- 7.4 PCA on log2-transformed, filtered data ----
+
+# Principal component analysis (PCA) was performed following
+# detection filtering and log2 transformation to assess overall
+# sample relationships. The PCA was used to identify any
+# unexplained technical structure that might indicate a need for
+# additional between-array normalization.
+
+# Transpose the expression matrix so that samples are rows
+# and probes are columns (required by prcomp).
+pca_input <- t(log2_expr_19439_filt)
+
+# Perform PCA, scaling each probe to unit variance.
+pca_19439 <- prcomp(
+  pca_input,
+  scale. = TRUE
+)
+
+# Calculate the percentage of variance explained by each
+# principal component for axis labels.
+var_explained <- summary(pca_19439)$importance[2, ] * 100
+
+# Confirm that the PCA sample order matches the clinical metadata.
+identical(
+  rownames(pca_input),
+  clin_19439$sample_id
+)
+
+## ---- 7.5 PCA plot coloured by disease group ----
+
+pca_df <- data.frame(
+  PC1 = pca_19439$x[, 1],
+  PC2 = pca_19439$x[, 2],
+  Group = clin_19439$group_status
+)
+
+ggplot(
+  pca_df,
+  aes(
+    x = PC1,
+    y = PC2,
+    colour = Group
+  )
+) +
+  geom_point(
+    size = 2.5,
+    alpha = 0.8
+  ) +
+  labs(
+    title = "PCA by disease group",
+    x = paste0(
+      "PC1 (",
+      round(var_explained[1], 1),
+      "%)"
+    ),
+    y = paste0(
+      "PC2 (",
+      round(var_explained[2], 1),
+      "%)"
+    ),
+    colour = "Disease group"
+  ) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  )
+
+```
+Quality control following log₂ transformation demonstrated comparable expression distributions across samples. PCA showed clustering primarily according to biological disease status rather than evidence of systematic technical variation. Therefore, additional between-array normalization was not performed.
+
+Conclusion: Quality control performed following detection filtering and log₂ transformation demonstrated highly comparable expression distributions across samples. Density plots showed substantial overlap of expression distributions, median sample expression remained consistent across disease groups, PCA revealed clustering driven primarily by biological phenotype rather than technical artefacts, and RLE plots displayed median values centred near zero with comparable interquartile ranges. Collectively, these findings supported the decision not to perform additional between-array normalization, consistent with the original BeadStudio average chip normalization reported by the study authors.
+
+
+
+## 7e. Check the most extreme PCA samples
+
+Five samples lie furthest from the origin; their clinical details are inspected before deciding to keep them.
+
+```{r}
+## ---- 7.6 Investigate potential PCA outliers ----
+
+# Calculate each sample's distance from the PCA origin
+pca_df$Distance <- sqrt(pca_df$PC1^2 + pca_df$PC2^2)
+
+# Identify the five most distant samples
+outlier_ids <- pca_df$Sample[
+  order(pca_df$Distance, decreasing = TRUE)[1:5]
+]
+
+# Flag only; no sample is removed (see the note under this chunk).
+clin_19439$is_outlier <- clin_19439$sample_id %in% outlier_ids
+
+clin_19439[
+  clin_19439$is_outlier,
+  c(
+    "sample_id",
+    "group_status",
+    "xray_grade",
+    "sputum_smear"
+  )
+]
+
+table(
+  clin_19439$is_outlier,
+  clin_19439$group_status
+)
+
+```
+Five samples were identified at the extremes of the PCA distribution. All belonged to the active tuberculosis (PTB) group. Comparison of available clinical metadata indicated no common clinical characteristic, as the samples represented a range of chest X-ray grades (minimal to advanced disease) and sputum smear statuses. Furthermore, density plots, median expression distributions, and RLE plots showed no evidence of systematic technical artefacts. Consequently, these samples were retained for downstream analyses as they likely reflect biological heterogeneity rather than technical variation.
+
+
+## 8. Map probes to gene symbols
+
+Use the platform annotation (GPL6947) from GEO.
+
+```{r}
+## ---- 8. Probe annotation ----
+
+# Download the GPL6947 platform annotation directly from GEO.
+# This provides the manufacturer-supplied mapping between Illumina
+# probe IDs and official gene symbols.
+
+gpl <- getGEO("GPL6947")
+gpl_table <- Table(gpl)
+
+# Inspect available annotation columns.
+colnames(gpl_table)
+
+# Extract probe IDs and corresponding gene symbols.
+annot_19439 <- gpl_table[, c("ID", "Symbol")]
+colnames(annot_19439) <- c("ProbeID", "Gene")
+
+## ---- 8.1 Merge probe annotation with expression data ----
+
+# Convert the log2-transformed, filtered expression matrix into a
+# data frame, retaining probe IDs for merging. Quantile normalization
+# was evaluated but not applied (see Normalization decision section),
+# so annotation proceeds directly on the filtered, log2-transformed
+# matrix.
+
+expr_df_19439 <- data.frame(
+  ProbeID = rownames(log2_expr_19439_filt),
+  log2_expr_19439_filt,
+  check.names = FALSE
+)
+
+# Merge probe annotation with the expression matrix.
+merged_19439 <- merge(
+  annot_19439,
+  expr_df_19439,
+  by = "ProbeID"
+)
+
+# Remove probes without an assigned gene symbol.
+merged_19439 <- merged_19439 |>
+  filter(
+    !is.na(Gene),
+    Gene != ""
+  )
+
+## ---- 8.2 Diagnostic checks ----
+
+cat("Annotated probes:", nrow(merged_19439), "\n")
+cat("Unique genes:", length(unique(merged_19439$Gene)), "\n")
+cat("Duplicate probes:",
+    nrow(merged_19439) - length(unique(merged_19439$Gene)),
+    "\n")
+```
+
+## 9. One probe per gene, then save
+
+Keep the probe with the highest mean expression for each gene and save the matrices.
+
+```{r}
+## ---- 9. Collapse duplicate probes ----
+
+# Multiple Illumina probes may map to the same gene symbol.
+# Retain the probe with the highest average expression for each gene.
+
+library(dplyr)
+
+# Calculate mean expression across all samples
+merged_19439$MeanExpression <- rowMeans(
+  merged_19439[, sapply(merged_19439, is.numeric)],
+  na.rm = TRUE
+)
+
+# Keep the highest-expressed probe for each gene
+# Highest-mean probe per gene (the report describes this as the collapse rule).
+gene_matrix_19439 <- merged_19439 |>
+  group_by(Gene) |>
+  slice_max(
+    MeanExpression,
+    n = 1,
+    with_ties = FALSE
+  ) |>
+  ungroup()
+
+# Remove annotation columns
+gene_matrix_final_19439 <- gene_matrix_19439 |>
+  select(-ProbeID, -MeanExpression)
+
+# Convert to gene × sample matrix
+gene_matrix_final_19439 <- as.matrix(gene_matrix_final_19439[, -1])
+
+rownames(gene_matrix_final_19439) <- gene_matrix_19439$Gene
+
+## ---- Diagnostic checks ----
+
+cat("Genes retained:", nrow(gene_matrix_final_19439), "\n")
+cat("Samples:", ncol(gene_matrix_final_19439), "\n")
+
+dim(gene_matrix_final_19439)
+class(gene_matrix_final_19439)
+
+head(gene_matrix_final_19439[, 1:5])
+
+sum(is.na(gene_matrix_final_19439))
+
+## ---- 9.2 Save processed data ----
+
+# Save the processed gene-level expression matrix and
+# corresponding clinical metadata for downstream integration.
+
+saveRDS(
+  gene_matrix_final_19439,
+  "gene_matrix_final_19439.rds"
+)
+
+saveRDS(
+  clin_19439,
+  "clin_19439.rds"
+)
+```
+
+## 10. Exploratory pooled PCA across the four datasets
+
+Needs the matrices from the other cleaning files (see the note at the top).
+
+```{r}
+# ---- Deeper diagnostics ----
+
+expr_list <- list(
+  GSE19439  = expr_19439,
+  GSE84076  = expr_84076,
+  GSE107994 = expr_107994,
+  GSE19444  = expr_19444
+)
+
+# 1. check class - are these all plain matrices?
+sapply(expr_list, class)
+
+# 2. check for duplicate column names WITHIN each matrix (very common culprit)
+sapply(expr_list, function(m) sum(duplicated(colnames(m))))
+
+# 3. check for stray whitespace or case differences
+sapply(expr_list, function(m) head(colnames(m)))
+
+# 4. how many genes in the intersection vs each individual matrix?
+common_genes <- Reduce(intersect, lapply(expr_list, colnames))
+length(common_genes)
+sapply(expr_list, ncol)
+
+
+# ---- Robust fix: dedupe + force identical column order via explicit match() ----
+
+expr_list <- lapply(expr_list, function(m) {
+  # collapse duplicate columns by keeping the first occurrence (adjust if you'd
+  # rather average duplicates, but for a quick PCA this is fine)
+  m <- m[, !duplicated(colnames(m)), drop = FALSE]
+  m
+})
+
+common_genes <- Reduce(intersect, lapply(expr_list, colnames))
+length(common_genes)
+
+expr_list <- lapply(expr_list, function(m) {
+  m[, match(common_genes, colnames(m)), drop = FALSE]
+})
+
+# check again
+sapply(expr_list, function(m) identical(colnames(m), common_genes))
+stopifnot(all(sapply(expr_list, function(m) identical(colnames(m), colnames(expr_list[[1]])))))
+
+X_pooled <- do.call(rbind, expr_list)
+study <- factor(rep(names(expr_list), times = sapply(expr_list, nrow)))
+```
