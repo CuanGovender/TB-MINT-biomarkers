@@ -1,0 +1,1022 @@
+---
+title: "GSE19444-Document"
+author: "CuanGovender"
+format:
+  html:
+    self-contained: true
+---
+
+## GSE19444 Data Cleaning Pipeline (Microarray, Illumina GPL6947)
+
+
+# GSE19444: UK whole-blood microarray cohort, held out (cleaning and QC)
+
+**What this file does.** It downloads the second UK Illumina HumanHT-12 v3 dataset (GSE19444), removes poorly detected probes, log2-transforms the data, checks quality (density, median, relative log expression and PCA plots), maps probes to gene symbols, keeps one probe per gene and saves a gene-by-sample matrix and a clinical table. The steps are the same as for GSE19439, so that the two microarray cohorts are processed identically.
+
+**Role in the project:** held-out external validation cohort. It is never used to fit or tune a model.
+
+**Inputs:** GEO series matrix (downloaded by `getGEO`) and the raw supplementary archive with the Illumina detection p-values (download it from GEO and set the path in section 4).
+
+**Outputs:** `detP_19444.rds`, `gene_matrix_final_19444.rds` (genes x samples) and `clin_19444.rds`. These are read by `MINT_Integration_Pipeline`.
+
+**Notes.**
+
+- The path in section 4 points to the author's computer and must be changed to run the file.
+- The disease label in this file is `PTB` (pulmonary TB). It is recoded to `ATB` in the MINT file.
+- The text between chunks is a set of working notes. Where its wording differs from the report, the report is the reference.
+
+
+
+## 1. Setup
+
+Load the packages used below.
+
+```{r}
+## ---- 1. Setup ----
+
+# Load packages required for downloading GEO data,
+# preprocessing Illumina microarray expression data,
+# data manipulation, and downstream analyses.
+
+library(GEOquery)
+library(SummarizedExperiment)
+library(tidyverse)
+library(janitor)
+library(sva)
+library(limma)
+
+
+```
+
+
+## 2. Download the GEO dataset
+
+Series matrix with the Illumina HumanHT-12 v3 platform (GPL6947).
+
+```{r}
+
+## ---- 2. Load GEO dataset ----
+
+# Download the GEO Series Matrix.
+# If multiple platforms are available, retain only the
+# Illumina HumanHT-12 v3 (GPL6947) platform.
+
+gset_19444 <- getGEO(
+  "GSE19444",
+  GSEMatrix = TRUE,
+  getGPL = FALSE
+)
+
+if (length(gset_19444) > 1) {
+  idx <- grep("GPL6947", attr(gset_19444, "names"))
+} else {
+  idx <- 1
+}
+
+gset_19444 <- gset_19444[[idx]]
+
+# Extract the probe-level expression matrix
+# (probes × samples).
+
+expr_19444 <- exprs(gset_19444)
+
+```
+
+
+## 3. Check the raw expression values
+
+Range, missing values and dimensions decide whether a log2 transformation is needed.
+
+```{r}
+## ---- 3. Initial diagnostic checks ----
+
+# Inspect the range of raw probe intensities to determine
+# whether log2 transformation is required.
+
+range(expr_19444, na.rm = TRUE)
+
+# Check for missing expression values across the entire dataset.
+
+sum(is.na(expr_19444))
+
+# Confirm the dimensions of the expression matrix
+# (probes × samples).
+
+dim(expr_19444)
+```
+Initial diagnostic checks were performed to assess the completeness and distribution of the raw expression data prior to preprocessing. Expression intensities ranged from -24.53 to 55,347.60, indicating that the dataset was represented on the original intensity scale and therefore required log₂ transformation before downstream analyses. No missing expression values were detected, confirming that the dataset was complete. The expression matrix comprised 48,803 probes measured across 54 samples, providing the expected dimensions for subsequent quality control and preprocessing.
+
+
+## 4. Import detection p-values
+
+Read the detection p-value of every probe in every sample from the raw supplementary files; they are used in the filter in section 6.
+
+```{r}
+## ---- 4. Import Illumina detection p-values ----
+
+# The GEO Series Matrix contains processed expression values but does
+# not retain Illumina detection p-values. These are extracted from the
+# supplementary sample files and assembled into a probe × sample matrix.
+# Detection p-values will later be used to identify probes that are
+# consistently detected above background.
+
+# Location of extracted supplementary files
+raw_dir <- "C:/Users/27826/Documents/HonoursProject/GSE19444_files/raw"
+
+# Identify all sample files (exclude the BGX manifest)
+sample_files <- list.files(
+  raw_dir,
+  pattern = "^GSM.*\\.txt\\.gz$",
+  full.names = TRUE
+)
+
+# Read the first sample to obtain the reference probe IDs.
+# Note: at least one supplementary file (GSM484599) contains trailing
+# rows with an empty string ("") rather than NA in ID_REF - likely
+# padding from a prior export through Excel, which pads sheets to its
+# legacy row limit of 65,536. janitor::remove_empty() does not catch
+# empty-string rows (only true NA), so filtering is done explicitly.
+first_sample <- read.delim(gzfile(sample_files[1]))
+first_sample <- first_sample[!is.na(first_sample$ID_REF) & first_sample$ID_REF != "", ]
+
+probe_ids <- first_sample$ID_REF
+
+# Create an empty matrix for Detection.PVal values
+detP_19444 <- matrix(
+  nrow = length(probe_ids),
+  ncol = length(sample_files)
+)
+
+rownames(detP_19444) <- probe_ids
+
+# Sample names become the GSM accession numbers
+colnames(detP_19444) <- sub(
+  "_.*",
+  "",
+  basename(sample_files)
+)
+
+# Loop through every supplementary file and extract Detection.PVal.
+# Each file is explicitly stripped of blank padding rows (empty
+# string or NA in ID_REF) before probe ordering is checked against
+# the reference probe_ids, ensuring correct alignment across all
+# 54 samples.
+
+for (i in seq_along(sample_files)) {
+
+  dat <- read.delim(gzfile(sample_files[i]))
+
+  # Remove padding rows: blank ID_REF (empty string) or true NA
+  dat <- dat[!is.na(dat$ID_REF) & dat$ID_REF != "", ]
+
+  # Ensure probe ordering is identical to probe_ids
+  stopifnot(all(dat$ID_REF == probe_ids))
+
+  detP_19444[, i] <- dat$Detection.PVal
+}
+
+## ---- 4.1 Validate detection matrix ----
+
+dim(detP_19444)
+
+sum(is.na(detP_19444))
+
+range(detP_19444)
+
+# Ensure both datasets contain the same probes
+stopifnot(setequal(
+  rownames(expr_19444),
+  rownames(detP_19444)
+))
+
+# Reorder detection matrix to match expression matrix
+detP_19444 <- detP_19444[rownames(expr_19444), ]
+
+# Final verification
+stopifnot(identical(
+  rownames(expr_19444),
+  rownames(detP_19444)
+))
+
+stopifnot(identical(
+  colnames(expr_19444),
+  colnames(detP_19444)
+))
+
+# Saved so the detection filter can be reproduced without the raw files.
+saveRDS(detP_19444, "detP_19444.rds")
+```
+
+
+## 5. Clinical metadata
+
+Clean, select and rename the clinical variables so they match the other cohorts.
+
+```{r}
+## ---- 5. Load and clean clinical metadata ----
+
+# Extract the sample phenotype (clinical metadata).
+pheno_19444 <- pData(gset_19444)
+
+# Standardise GEO column names to lower case with underscores.
+clin_19444 <- janitor::clean_names(pheno_19444)
+
+# Retain only the clinical variables relevant for quality control,
+# exploratory analyses, and downstream modelling.
+clin_19444 <- dplyr::select(
+  clin_19444,
+  geo_accession,
+  illness_ch1,
+  gender_ch1,
+  age_ch1,
+  ethnicity_ch1,
+  geographical_region_ch1,
+  region_of_birth_ch1,
+  bcg_vaccinated_ch1,
+  exposure_latent_ch1,
+  tst_ch1,
+  sputum_smear_ch1,
+  sputum_culture_ch1,
+  bal_smear_ch1,
+  bal_culture_ch1,
+  smear_of_index_case_ch1,
+  index_case_disease_site_ch1,
+  isolate_sensitivity_ch1,
+  modal_x_ray_grade_ch1
+)
+
+# Rename variables using a consistent naming convention to simplify
+# downstream integration across datasets.
+clin_19444 <- clin_19444 %>%
+  rename(
+    sample_id         = geo_accession,
+    group_status      = illness_ch1,
+    gender            = gender_ch1,
+    age               = age_ch1,
+    ethnicity         = ethnicity_ch1,
+    geographic_region = geographical_region_ch1,
+    birth_region      = region_of_birth_ch1,
+    bcg_status        = bcg_vaccinated_ch1,
+    latent_exposure   = exposure_latent_ch1,
+    tst_result        = tst_ch1,
+    sputum_smear      = sputum_smear_ch1,
+    sputum_culture    = sputum_culture_ch1,
+    bal_smear         = bal_smear_ch1,
+    bal_culture       = bal_culture_ch1,
+    index_case_smear  = smear_of_index_case_ch1,
+    index_case_site   = index_case_disease_site_ch1,
+    drug_sensitivity  = isolate_sensitivity_ch1,
+    xray_grade        = modal_x_ray_grade_ch1
+  )
+
+# Convert age to numeric for downstream analyses.
+clin_19444$age <- as.numeric(clin_19444$age)
+
+# Harmonise disease group labels across all tuberculosis datasets.
+clin_19444$group_status <- recode(
+  clin_19444$group_status,
+  "Control (BCG+)" = "Control",
+  "Control (BCG-)" = "Control",
+  "Latent" = "LTBI",
+  "PTB" = "PTB"
+)
+
+# Store disease group as an ordered factor for plotting and modelling.
+clin_19444$group_status <- factor(
+  clin_19444$group_status,
+  levels = c("Control", "LTBI", "PTB")
+)
+
+# Confirm that the phenotype data remain aligned with the expression matrix.
+all(clin_19444$sample_id == colnames(expr_19444))
+
+# Inspect the cleaned clinical metadata.
+str(clin_19444)
+
+# Confirm sample numbers in each disease group.
+table(clin_19444$group_status)
+```
+
+
+## 5a. Raw QC: median expression by group
+
+Colours are fixed here and reused in the plots that follow.
+
+```{r}
+## ---- 5.1 Raw QC: Median expression by disease group ----
+
+group_cols <- c(Control = "#1B9E77", LTBI = "#D95F02", PTB = "#7570B3")
+
+
+
+# Calculate the median raw expression for each sample.
+median_raw <- data.frame(
+  Sample = colnames(expr_19444),
+  Group  = clin_19444$group_status,
+  Median = apply(expr_19444, 2, median)
+)
+
+# Boxplot of sample median expression grouped by disease status.
+boxplot(
+  Median ~ Group,
+  data = median_raw,
+  outline = FALSE,
+  col = group_cols,
+  xlab = "Disease group",
+  ylab = "Median raw expression",
+  main = "Raw median expression by disease group"
+)
+
+# Overlay individual samples using jittered points.
+stripchart(
+  Median ~ Group,
+  data = median_raw,
+  vertical = TRUE,
+  method = "jitter",
+  jitter = 0.15,
+  pch = 19,
+  col = adjustcolor("black", alpha.f = 0.6),
+  add = TRUE
+)
+```
+
+
+##boxplot (Raw QC Assessment)
+
+The median raw expression intensity was compared across disease groups as an initial quality control assessment. Overall, the distributions were broadly comparable across Control, LTBI, and PTB samples, with no obvious outlier arrays. PTB samples exhibited a slightly lower median expression than the Control and LTBI groups; however, substantial overlap between groups indicated that the observed variation was within the expected range for raw microarray data prior to normalization.
+
+
+## 5b. Raw PCA
+
+```{r}
+## ---- 5.2 Raw PCA ----
+
+# Perform principal component analysis (PCA) on the raw
+# expression matrix to assess overall sample relationships
+# prior to normalisation.
+
+pca_raw <- prcomp(
+  t(expr_19444),
+  scale. = TRUE
+)
+
+# Define colours for each disease group.
+group_factor <- clin_19444$group_status
+
+plot(
+  pca_raw$x[, 1],
+  pca_raw$x[, 2],
+  col = group_cols[group_factor],
+  pch = 19,
+  cex = 1.3,
+  xlab = paste0(
+    "PC1 (",
+    round(summary(pca_raw)$importance[2, 1] * 100, 1),
+    "%)"
+  ),
+  ylab = paste0(
+    "PC2 (",
+    round(summary(pca_raw)$importance[2, 2] * 100, 1),
+    "%)"
+  ),
+  main = "Raw PCA by disease group"
+)
+
+legend(
+  x = "topright",
+  inset = c(0.03, 0.03),
+  legend = levels(group_factor),
+  col = group_cols,
+  pch = 19,
+  bty = "n"
+)
+
+```
+
+Principal component analysis (PCA) was performed on the raw expression matrix to assess the overall structure of the dataset prior to normalization. The first two principal components explained 7.7% and 4.2% of the total variance, respectively. While substantial overlap was observed between the disease groups, several PTB samples tended to separate along PC1, suggesting that disease status contributes to the underlying variation. No obvious outlier samples were identified based on the PCA distribution.
+
+## 5c. Raw PCA by gender
+
+```{r}
+## ---- 5.3 PCA by gender ----
+
+# Visualise the PCA coloured by gender to assess whether
+# sex contributes to the major sources of variation.
+
+plot(
+  pca_raw$x[, 1],
+  pca_raw$x[, 2],
+  col = as.factor(clin_19444$gender),
+  pch = 19,
+  cex = 1.3,
+  xlab = paste0(
+    "PC1 (",
+    round(summary(pca_raw)$importance[2, 1] * 100, 1),
+    "%)"
+  ),
+  ylab = paste0(
+    "PC2 (",
+    round(summary(pca_raw)$importance[2, 2] * 100, 1),
+    "%)"
+  ),
+  main = "Raw PCA coloured by gender"
+)
+
+legend(
+  "topright",
+  inset = c(0.03, 0.03),
+  legend = levels(as.factor(clin_19444$gender)),
+  col = 1:length(levels(as.factor(clin_19444$gender))),
+  pch = 19,
+  bty = "n"
+)
+```
+The PCA was coloured according to gender to investigate whether sex contributed to the major sources of variation in the dataset. Male and female samples were distributed throughout the PCA space with no distinct clustering, indicating that gender was not a dominant source of variation in the raw expression data.
+
+
+## 5d. Raw PCA by ethnicity
+
+```{r}
+## ---- 5.4 PCA by ethnicity ----
+
+# Visualise the PCA coloured by ethnicity to assess whether
+# genetic ancestry contributes to variation in the dataset.
+
+plot(
+  pca_raw$x[, 1],
+  pca_raw$x[, 2],
+  col = as.factor(clin_19444$ethnicity),
+  pch = 19,
+  cex = 1.3,
+  xlab = paste0(
+    "PC1 (",
+    round(summary(pca_raw)$importance[2, 1] * 100, 1),
+    "%)"
+  ),
+  ylab = paste0(
+    "PC2 (",
+    round(summary(pca_raw)$importance[2, 2] * 100, 1),
+    "%)"
+  ),
+  main = "Raw PCA coloured by ethnicity"
+)
+
+legend(
+  "topright",
+  inset = c(0.03, 0.03),
+  legend = levels(as.factor(clin_19444$ethnicity)),
+  col = 1:length(levels(as.factor(clin_19444$ethnicity))),
+  pch = 19,
+  bty = "n",
+  cex = 0.8
+)
+
+```
+The PCA was coloured according to ethnicity to assess whether ancestry-related differences contributed to the major sources of variation in the dataset. Samples from different ethnic groups were broadly intermixed with no distinct clustering, indicating that ethnicity was not a dominant driver of variation in the raw expression data.
+
+
+## 5e. Raw PCA by birth region
+
+```{r}
+## ---- 5.5 PCA by birth region ----
+
+# Visualise the PCA coloured by region of birth to assess
+# whether birthplace contributes to variation in the dataset.
+
+plot(
+  pca_raw$x[, 1],
+  pca_raw$x[, 2],
+  col = as.factor(clin_19444$birth_region),
+  pch = 19,
+  cex = 1.3,
+  xlab = paste0(
+    "PC1 (",
+    round(summary(pca_raw)$importance[2, 1] * 100, 1),
+    "%)"
+  ),
+  ylab = paste0(
+    "PC2 (",
+    round(summary(pca_raw)$importance[2, 2] * 100, 1),
+    "%)"
+  ),
+  main = "Raw PCA coloured by birth region"
+)
+
+legend(
+  "topright",
+  inset = c(0.03, 0.03),
+  legend = levels(as.factor(clin_19444$birth_region)),
+  col = 1:length(levels(as.factor(clin_19444$birth_region))),
+  pch = 19,
+  bty = "n"
+)
+
+```
+The PCA was coloured according to birth region to assess whether participant birthplace contributed to variation in the dataset. UK-born and non-UK-born participants were broadly distributed throughout the PCA space with no distinct clustering, suggesting that birth region was not a major source of variation in the raw expression data.
+
+
+## 5f. Raw PCA by BCG vaccination status
+
+```{r}
+## ---- 5.6 PCA by BCG vaccination status ----
+
+# Visualise the PCA coloured by BCG vaccination status to
+# assess whether vaccination history contributes to variation.
+
+plot(
+  pca_raw$x[, 1],
+  pca_raw$x[, 2],
+  col = as.factor(clin_19444$bcg_status),
+  pch = 19,
+  cex = 1.3,
+  xlab = paste0(
+    "PC1 (",
+    round(summary(pca_raw)$importance[2, 1] * 100, 1),
+    "%)"
+  ),
+  ylab = paste0(
+    "PC2 (",
+    round(summary(pca_raw)$importance[2, 2] * 100, 1),
+    "%)"
+  ),
+  main = "Raw PCA coloured by BCG vaccination status"
+)
+
+legend(
+  "topright",
+  inset = c(0.03, 0.03),
+  legend = levels(as.factor(clin_19444$bcg_status)),
+  col = 1:length(levels(as.factor(clin_19444$bcg_status))),
+  pch = 19,
+  bty = "n",
+  cex = 0.8
+)
+
+```
+The PCA was coloured according to BCG vaccination status to determine whether vaccination history contributed to the major sources of variation in the dataset. Samples from vaccinated, unvaccinated, and unknown-status individuals showed substantial overlap with no distinct clustering, indicating that BCG vaccination status was not a dominant driver of variation in the raw expression data.
+
+
+## 5g. Raw PCA by latent exposure
+
+```{r}
+## ---- 5.7 PCA by latent exposure ----
+
+# Visualise the PCA coloured by latent tuberculosis exposure
+# to assess whether exposure history contributes to variation.
+
+plot(
+  pca_raw$x[, 1],
+  pca_raw$x[, 2],
+  col = as.factor(clin_19444$latent_exposure),
+  pch = 19,
+  cex = 1.3,
+  xlab = paste0(
+    "PC1 (",
+    round(summary(pca_raw)$importance[2, 1] * 100, 1),
+    "%)"
+  ),
+  ylab = paste0(
+    "PC2 (",
+    round(summary(pca_raw)$importance[2, 2] * 100, 1),
+    "%)"
+  ),
+  main = "Raw PCA coloured by latent exposure"
+)
+
+legend(
+  "topright",
+  inset = c(0.03, 0.03),
+  legend = levels(as.factor(clin_19444$latent_exposure)),
+  col = 1:length(levels(as.factor(clin_19444$latent_exposure))),
+  pch = 19,
+  bty = "n",
+  cex = 0.8
+)
+
+```
+The PCA was coloured according to latent tuberculosis exposure to investigate whether exposure history contributed to the major sources of variation in the dataset. Samples from the different exposure categories showed substantial overlap with no distinct clustering, indicating that latent exposure was not a dominant source of variation in the raw expression data.
+
+To investigate potential sources of variation, PCA was coloured according to several available clinical variables, including disease status, sex, ethnicity, birth region, BCG vaccination status, and latent exposure history. Of these variables, disease status demonstrated the clearest, albeit partial, separation, with PTB samples tending to separate along PC1. In contrast, the remaining clinical variables showed substantial overlap between groups and did not explain the primary axes of variation. These findings suggest that the dominant biological signal within the dataset is associated with tuberculosis disease status rather than demographic or clinical covariates.
+
+
+## 5h. Raw density plot
+
+```{r}
+## ---- 5.8 Raw density plot ----
+
+plotDensities(
+  expr_19444,
+  legend = FALSE,
+  main = "Density plot of raw expression intensities",
+  xlab = "Expression intensity"
+)
+
+```
+
+
+## 6. Detection p-value filter
+
+Keep probes detected (p < 0.01) in at least half the samples of any group.
+
+```{r}
+## ---- 6. Detection p-value filtering ----
+
+# Biological groups
+group <- clin_19444$group_status
+
+# Empty logical vector (one value per probe)
+# One TRUE/FALSE per probe; a probe is kept if it passes in at least one group.
+keep <- logical(nrow(detP_19444))
+
+# Check each group separately
+for (g in unique(group)) {
+
+  idx <- group == g
+
+  detected <- rowSums(detP_19444[, idx] < 0.01)
+
+  threshold <- ceiling(0.50 * sum(idx))
+
+  keep <- keep | (detected >= threshold)
+}
+
+# Filter expression matrix
+expr_19444_filt <- expr_19444[keep, ]
+
+# Filter detection matrix
+detP_19444_filt <- detP_19444[keep, ]
+
+## ---- 6.1 Detection filter summary ----
+
+cat("Probes before filtering :", nrow(expr_19444), "\n")
+
+cat("Probes retained         :", nrow(expr_19444_filt), "\n")
+
+cat("Probes removed          :",
+    nrow(expr_19444) - nrow(expr_19444_filt),
+    "\n")
+
+cat("Percentage retained     :",
+    round(100 * nrow(expr_19444_filt) / nrow(expr_19444), 2),
+    "%\n")
+
+```
+| Metric              |  Value |
+| ------------------- | -----: |
+| Total probes        | 48,803 |
+| Probes retained     | 13,053 |
+| Probes removed      | 35,750 |
+| Percentage retained |  26.7% |
+
+
+
+## 7. Log2 transformation
+
+A small offset makes all values positive before the log.
+
+```{r}
+## ---- 7. Log2 transformation (offset-shifted) ----
+
+# Following detection p-value filtering, only 0.11% of remaining
+# values are negative (range: -12.11 to 55347.60), confirming that
+# detection filtering removed almost all probes affected by
+# BeadStudio's background-subtraction artifacts. A small global
+# offset is applied to shift the minimal remaining negative values
+# into positive range before log2 transformation, following standard
+# practice for Illumina HumanHT-12 data (forcePos-style offset).
+
+global_min <- min(expr_19444_filt, na.rm = TRUE)
+# Offset makes the minimum value 1, so log2 is defined for every entry.
+offset <- abs(global_min) + 1
+
+log2_expr_19444_filt <- log2(expr_19444_filt + offset)
+
+range(log2_expr_19444_filt, na.rm = TRUE)
+sum(is.infinite(log2_expr_19444_filt))
+summary(as.vector(log2_expr_19444_filt))
+
+```
+
+## 7a. PCA after filtering and log2
+
+```{r}
+## ---- 7.1 PCA on log2-transformed, filtered data ----
+
+# PCA is used here to check for unexplained technical/batch structure
+# prior to deciding whether additional between-array normalization
+# is warranted, following visual inspection of boxplots and density
+# plots.
+
+# Transpose so samples are rows, probes are columns (required by prcomp)
+pca_input <- t(log2_expr_19444_filt)
+
+# Run PCA, scaling each probe to unit variance
+pca_19444 <- prcomp(pca_input, scale. = TRUE)
+
+# Proportion of variance explained, for axis labels
+var_explained <- summary(pca_19444)$importance[2, ] * 100
+
+# Confirm sample order matches clinical metadata before coloring
+identical(rownames(pca_input), clin_19444$sample_id)
+
+## ---- 8.1 PCA plot colored by disease group ----
+
+
+
+pca_df <- data.frame(
+  PC1 = pca_19444$x[, 1],
+  PC2 = pca_19444$x[, 2],
+  group = clin_19444$group_status
+)
+
+ggplot(pca_df, aes(x = PC1, y = PC2, color = group)) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  labs(
+    title = "PCA: Log2-transformed, filtered GSE19444 expression",
+    x = paste0("PC1 (", round(var_explained[1], 1), "%)"),
+    y = paste0("PC2 (", round(var_explained[2], 1), "%)"),
+    color = "Group"
+  ) +
+  theme_minimal()
+
+```
+
+
+
+## 7b. Compare the PC1 outlier cluster with the rest of the cohort
+
+Four PTB samples lie far along PC1; their clinical details are inspected before deciding to keep them.
+
+```{r}
+### ---- 7.1 Compare outlier group to the rest of the cohort ----
+
+outlier_ids <- rownames(pca_19444$x)[pca_19444$x[, "PC1"] < -100]
+# Flag only; no sample is removed (see the note under this chunk).
+clin_19444$is_outlier <- clin_19444$sample_id %in% outlier_ids
+
+clin_19444[clin_19444$is_outlier, 
+           c("sample_id", "group_status", "xray_grade", "sputum_smear")]
+
+table(clin_19444$is_outlier, clin_19444$xray_grade)
+
+```
+PCA on the log2-transformed, filtered matrix (Figure X) revealed a distinct cluster of four PTB samples separated along PC1 (23.2% of variance) from the remaining cohort. Cross-referencing these samples against clinical metadata showed that all four shared an "Advanced" radiological grade with the only variable examined (alongside gender, ethnicity, geographic region, and BCG status) that distinguished this cluster from the rest of the PTB group. Of the eight PTB patients classified as "Advanced" grade, four formed this distinct cluster, while none of the Minimal, Moderate, or No-disease PTB patients did. This pattern is consistent with prior evidence that active tuberculosis is transcriptionally heterogeneous, with disease severity and extent modulating the strength of the interferon-driven signature. This separation was therefore interpreted as reflecting genuine biological variation in disease severity within the PTB group, rather than a technical or batch artifact, and all four samples were retained in the dataset.
+
+
+## 7c. Median expression after log2
+
+```{r}
+## ---- 7.2 Post-log2 QC: Median expression by disease group ----
+
+# Calculate the median log2-transformed expression for each sample.
+median_log2 <- data.frame(
+  Sample = colnames(log2_expr_19444_filt),
+  Group  = clin_19444$group_status,
+  Median = apply(log2_expr_19444_filt, 2, median)
+)
+
+# Boxplot of sample median expression grouped by disease status.
+boxplot(
+  Median ~ Group,
+  data = median_log2,
+  outline = FALSE,
+  col = group_cols,
+  xlab = "Disease group",
+  ylab = "Median log2 expression",
+  main = "Log2-transformed median expression by disease group"
+)
+
+# Overlay individual samples using jittered points.
+stripchart(
+  Median ~ Group,
+  data = median_log2,
+  vertical = TRUE,
+  method = "jitter",
+  jitter = 0.15,
+  pch = 19,
+  col = adjustcolor("black", alpha.f = 0.6),
+  add = TRUE
+)
+```
+
+
+## 7d. Are the lowest-median PTB samples the same as the PC1 outliers?
+
+```{r}
+
+## ---- 7.2 Verify: are the lowest-median PTB samples the same outliers? ----
+
+# Cross-check whether the samples with the lowest median log2
+# expression within the PTB group correspond to the four samples
+# previously identified as an isolated PCA cluster (Advanced x-ray
+# grade).
+
+ptb_medians <- median_log2[median_log2$Group == "PTB", ]
+ptb_medians <- ptb_medians[order(ptb_medians$Median), ]
+
+head(ptb_medians, 8)  # lowest 8 medians within PTB
+
+# Flag which of these are the known outlier IDs
+ptb_medians$is_known_outlier <- ptb_medians$Sample %in% outlier_ids
+ptb_medians
+
+```
+To verify that the reduced median expression and increased spread observed in the PTB group (Figure X) reflected the same four samples identified in the PCA and RLE analyses, PTB samples were ranked by median log2 expression. Three of the four previously flagged samples (GSM484598, GSM484611, GSM484631) occupied the three lowest positions in the entire PTB group, with the fourth (GSM484596) ranking sixth overall. This convergence across three independent diagnostics — PCA, RLE, and per-sample median expression — provides consistent evidence that these four Advanced-grade samples represent a coherent, biologically-driven subgroup within PTB, rather than artifacts arising from any single analysis method.
+
+
+
+## 7e. Density plot by group
+
+```{r}
+## ---- 7.3 Density plot by disease group ----
+
+# Density plot of log2-transformed expression, colored by disease
+# group rather than individual sample, for a more interpretable
+# comparison of distribution shape across Control/LTBI/PTB.
+
+
+plotDensities(
+  log2_expr_19444_filt,
+  group = clin_19444$group_status,
+  col = group_cols,
+  legend = "topright",
+  main = "Density after log2 transformation, by disease group"
+)
+
+```
+Density distributions of log2-transformed expression values, coloured by disease group (Control, LTBI, PTB). All three groups show near-identical distribution shape and peak location, indicating no systematic group-level shift in overall expression.
+
+
+## 7f. Relative log expression (RLE)
+
+```{r}
+## ---- 7.4 RLE plot by disease group ----
+
+# RLE (relative log expression): for each probe, subtract the
+# median across all samples, then examine per-sample distribution.
+# Boxes are colored by disease group to visually connect any
+# systematic shifts back to biological status.
+
+rle_data <- log2_expr_19444_filt - matrixStats::rowMedians(log2_expr_19444_filt)
+
+# Order samples by group for a cleaner, grouped visual layout
+sample_order <- order(clin_19444$group_status)
+
+boxplot(
+  rle_data[, sample_order],
+  outline = FALSE,
+  las = 2,
+  cex.axis = 0.6,
+  col = group_cols[clin_19444$group_status[sample_order]],
+  main = "RLE plot after log2 transformation",
+  ylab = "Relative log expression"
+)
+abline(h = 0, col = "red", lty = 2)
+
+legend("topright", legend = levels(clin_19444$group_status),
+       fill = group_cols, cex = 0.8, bty = "n")
+
+```
+Relative log expression (RLE) per sample, grouped by disease group. Control and LTBI samples show tight, symmetric distributions centred near zero. The PTB group shows greater spread and several samples with medians below zero, consistent with a biologically heterogeneous subgroup rather than a technical batch effect.
+
+
+
+
+##Normalization decision
+
+Additional between-array normalization was evaluated but not applied, as density, boxplot, PCA, and RLE diagnostics showed no evidence of a technical batch effect requiring correction. The one notable structure identified — a cluster of four PTB samples — was consistently linked across all four diagnostics to an "Advanced" radiological grade, indicating genuine biological heterogeneity in disease severity rather than a technical artifact.
+
+Together, these diagnostics indicate that the structure observed in this dataset reflects genuine biological variation in disease severity rather than a technical batch effect requiring correction, and quantile normalization was therefore omitted from the final pipeline.
+
+
+
+
+## 8. Map probes to gene symbols
+
+Use the platform annotation (GPL6947) from GEO.
+
+```{r}
+## ---- 8. Probe annotation ----
+
+# Download the GPL6947 platform annotation directly from GEO.
+# This provides the manufacturer-supplied mapping between Illumina
+# probe IDs and official gene symbols.
+
+gpl <- getGEO("GPL6947")
+gpl_table <- Table(gpl)
+
+# Inspect available annotation columns.
+colnames(gpl_table)
+
+# Extract probe IDs and corresponding gene symbols.
+annot_19444 <- gpl_table[, c("ID", "Symbol")]
+colnames(annot_19444) <- c("ProbeID", "Gene")
+
+## ---- 8.1 Merge probe annotation with expression data ----
+
+# Convert the log2-transformed, filtered expression matrix into a
+# data frame, retaining probe IDs for merging. Quantile normalization
+# was evaluated but not applied (see Normalization decision section),
+# so annotation proceeds directly on the filtered, log2-transformed
+# matrix.
+
+expr_df_19444 <- data.frame(
+  ProbeID = rownames(log2_expr_19444_filt),
+  log2_expr_19444_filt,
+  check.names = FALSE
+)
+
+# Merge probe annotation with the expression matrix.
+merged_19444 <- merge(
+  annot_19444,
+  expr_df_19444,
+  by = "ProbeID"
+)
+
+# Remove probes without an assigned gene symbol.
+merged_19444 <- merged_19444 |>
+  filter(
+    !is.na(Gene),
+    Gene != ""
+  )
+
+## ---- 9.2 Diagnostic checks ----
+
+cat("Annotated probes:", nrow(merged_19444), "\n")
+cat("Unique genes:", length(unique(merged_19444$Gene)), "\n")
+
+```
+
+
+## 9. One probe per gene, then save
+
+Keep the probe with the highest mean expression for each gene and save the matrices.
+
+```{r}
+## ---- 9. Collapse duplicate probes ----
+
+# Multiple Illumina probes may map to the same gene symbol.
+# To obtain a single expression value per gene, the probe with
+# the highest mean expression across all samples is retained.
+
+library(dplyr)
+
+# Calculate mean expression across all samples
+merged_19444$MeanExpression <- rowMeans(
+  merged_19444[, sapply(merged_19444, is.numeric)],
+  na.rm = TRUE
+)
+
+# Retain the highest-expressed probe for each gene
+gene_matrix_19444 <- merged_19444 |>
+  group_by(Gene) |>
+  slice_max(
+    MeanExpression,
+    n = 1,
+    with_ties = FALSE
+  ) |>
+  ungroup()
+
+# Remove annotation columns prior to creating the expression matrix.
+
+gene_matrix_final_19444 <- gene_matrix_19444 |>
+  select(-ProbeID, -MeanExpression)
+
+# Convert to a gene × sample expression matrix.
+
+gene_matrix_final_19444 <- as.matrix(
+  gene_matrix_final_19444[, -1]
+)
+
+rownames(gene_matrix_final_19444) <- gene_matrix_19444$Gene
+
+## ---- 9.1 Diagnostic checks ----
+
+cat("Genes retained:", nrow(gene_matrix_final_19444), "\n")
+cat("Samples:", ncol(gene_matrix_final_19444), "\n")
+
+dim(gene_matrix_final_19444)
+
+class(gene_matrix_final_19444)
+
+head(gene_matrix_final_19444[, 1:5])
+
+sum(is.na(gene_matrix_final_19444))
+
+## ---- 9.2 Save processed data ----
+
+# Save the processed gene-level expression matrix and
+# corresponding clinical metadata for downstream integration.
+
+saveRDS(
+  gene_matrix_final_19444,
+  "gene_matrix_final_19444.rds"
+)
+
+saveRDS(
+  clin_19444,
+  "clin_19444.rds"
+)
+```
+
+
